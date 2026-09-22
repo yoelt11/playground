@@ -1,0 +1,8 @@
+# Results/data are synced out to research/experiments/ via sync-experiment-results —
+# they don't belong in git history.
+experiments/*/results/
+experiments/*/data/
+
+__pycache__/
+*.pyc
+.venv/
