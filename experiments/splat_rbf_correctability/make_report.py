@@ -110,7 +110,7 @@ coarse basis (peak gain %(max_gain)s).
 
 Ported from Edgar's `gs-rbf.py` into pure JAX; both representations share centers,
 scales, rotation and basis — only the compositing differs. RBF weights are signed.
-Splat uses front-to-back alpha compositing with transmittance $T_i = prod_(j < i) (1 - a_j)$.
+Splat uses front-to-back alpha compositing with a transmittance that couples every splat nonlinearly, so corrections cannot be added linearly.
 
 == Results (rel-L2, lower is better)
 
@@ -120,8 +120,8 @@ Splat uses front-to-back alpha compositing with transmittance $T_i = prod_(j < i
   stroke: 0.5pt + rgb("#cccccc"),
   inset: 5pt,
   align: (left, center),
-  %(hdr)s,
-  %(trows)s,
+%(hdr)s
+%(trows)s
 )
 
 Key columns: `rel_l2` recovery rel-L2; `correct_rel_before/after` = one-shot linear
