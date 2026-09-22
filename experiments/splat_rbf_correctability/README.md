@@ -66,7 +66,8 @@ splat_rbf_correctability/
 ## Usage
 
 ```bash
-# run the whole sweep (or single (mode,N,target) in run_training.py)
+# run the whole sweep (or single (mode,N,target)) in run_training.py) — and a brief
+# NeurIPS-styled PDF summary ((results/report.pdf, typst/bloated-neurips) afterward
 launch-experiment run playground \
   "cd experiments/splat_rbf_correctability && python3 run_pipeline.py" \
   --experiment splat_rbf_correctability
