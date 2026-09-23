@@ -56,9 +56,10 @@ def main():
             arms.append({
                 "arm": r["arm"],
                 "relL2": pm(float(r["relL2_mean"]), float(r["relL2_std"])),
-                "s2s": f"{float(r['step_time_mean']):.3f}",
-                "gcos": f"{float(r['grad_cos_mean']):+.3f}",
-                "span": f"{float(r['in_span_mean']):.2f}/{float(r['out_span_mean']):.2f}",
+                "s2s": f"{float(r['step_time_mean']):.3f}" if r.get("step_time_mean") else "n/a",
+                "gcos": f"{float(r['grad_cos_mean']):+.3f}" if r.get("grad_cos_mean") else "n/a",
+                "span": (f"{float(r['in_span_mean']):.2f}/{float(r['out_span_mean']):.2f}"
+                         if r.get("in_span_mean") else "n/a"),
                 "stab": r["stability"],
             })
 
