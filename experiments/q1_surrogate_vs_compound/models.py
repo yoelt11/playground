@@ -68,6 +68,94 @@ class RBFField(nn.Module):
         return (lap_phi @ self.effective_weights).unsqueeze(-1)
 
 
+class AnisotropicRBFField(nn.Module):
+    """ePIL/VSD anisotropic Gaussian RBF with learnable shape (K, 6) latents.
+
+    Per kernel j the VSD vector is [μ_x, μ_y, log σ_x, log σ_y, angle, (log)w].
+    Field uses the same O(1) weight reparam as RBFField:
+      u(x) = Σ_j (σ_w · w̃_j) φ_j(x),  σ_w = max(|w_base|) frozen,
+      w̃ = w_base / σ_w trainable.
+
+    Kernel (rotated anisotropic Gaussian, ePIL inv_cov form):
+      R(a) = [[cos a, -sin a], [sin a, cos a]],
+      Σ^{-1} = R diag(σ_x^{-2}, σ_y^{-2}) R^T,
+      φ(x) = exp(−½ (x−μ)^T Σ^{-1} (x−μ)).
+
+    Init matching isotropic Kansa φ = exp(−ε² r²):
+      angle=0, σ_x=σ_y=1/(ε√2)  so  ½/σ² = ε²  (NOT σ=ε — that would be
+      exp(−r²/(2ε²)), which does not reproduce the Kansa base). Centers and
+      weights from the shared Kansa solve. At step 0 the field == u_base.
+    """
+
+    def __init__(self, centers, weights, epsilon: float):
+        super().__init__()
+        w = torch.as_tensor(weights, dtype=torch.float64).reshape(-1).clone()
+        sigma_w = float(torch.max(torch.abs(w)).item())
+        if sigma_w < 1e-30:
+            sigma_w = 1.0
+        self.register_buffer(
+            "weight_scale", torch.tensor(sigma_w, dtype=torch.float64)
+        )
+        self.register_buffer(
+            "epsilon", torch.tensor(float(epsilon), dtype=torch.float64)
+        )
+        # Match isotropic exp(−ε² r²) under Mahalanobis form: σ = 1/(ε√2).
+        sigma_iso = 1.0 / (float(epsilon) * math.sqrt(2.0))
+        k = w.numel()
+        mu = torch.as_tensor(centers, dtype=torch.float64).clone()
+        if mu.ndim != 2 or mu.shape[1] != 2:
+            raise ValueError(f"centers must be (K,2), got {tuple(mu.shape)}")
+        if mu.shape[0] != k:
+            raise ValueError("centers/weights length mismatch")
+        self.centers = nn.Parameter(mu)
+        self.log_sigma_x = nn.Parameter(
+            torch.full((k,), math.log(sigma_iso), dtype=torch.float64)
+        )
+        self.log_sigma_y = nn.Parameter(
+            torch.full((k,), math.log(sigma_iso), dtype=torch.float64)
+        )
+        self.angles = nn.Parameter(torch.zeros(k, dtype=torch.float64))
+        self.weights = nn.Parameter(w / sigma_w)
+
+    @property
+    def effective_weights(self) -> torch.Tensor:
+        return self.weight_scale * self.weights
+
+    @property
+    def sigma_x(self) -> torch.Tensor:
+        return torch.exp(self.log_sigma_x)
+
+    @property
+    def sigma_y(self) -> torch.Tensor:
+        return torch.exp(self.log_sigma_y)
+
+    def inv_covs(self) -> torch.Tensor:
+        """Σ^{-1} for each kernel, shape (K, 2, 2) — ePIL precompute_params form."""
+        sx = self.sigma_x
+        sy = self.sigma_y
+        c = torch.cos(self.angles)
+        s = torch.sin(self.angles)
+        # R = [[c, -s], [s, c]]; inv = R @ diag(1/sx², 1/sy²) @ R^T
+        inv_xx = c * c / (sx * sx) + s * s / (sy * sy)
+        inv_yy = s * s / (sx * sx) + c * c / (sy * sy)
+        inv_xy = c * s * (1.0 / (sx * sx) - 1.0 / (sy * sy))
+        row0 = torch.stack([inv_xx, inv_xy], dim=-1)
+        row1 = torch.stack([inv_xy, inv_yy], dim=-1)
+        return torch.stack([row0, row1], dim=-2)  # (K, 2, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != torch.float64:
+            x = x.double()
+        diff = x.unsqueeze(1) - self.centers.unsqueeze(0)  # (N, K, 2)
+        inv = self.inv_covs()  # (K, 2, 2)
+        # mahalanobis_j = diff_j^T inv_j diff_j
+        # (N,K,2) @ (K,2,2) → (N,K,2) then · diff
+        tmp = torch.einsum("nkd,kde->nke", diff, inv)
+        mahal = (tmp * diff).sum(dim=-1)  # (N, K)
+        phi = torch.exp(-0.5 * mahal)
+        return (phi @ self.effective_weights).unsqueeze(-1)
+
+
 class SolutionNet(nn.Module):
     """Fourier-feature MLP with hard Dirichlet BC (u=0 on ∂Ω).
 

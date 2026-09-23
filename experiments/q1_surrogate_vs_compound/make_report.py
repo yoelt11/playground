@@ -87,10 +87,17 @@ def main():
     data gradient. Regression onto a single projected target removes the conflict.
 
     Across {n_seeds} seeds (shared {gt_frac}-fraction GT subset, same network for arms 1 and 2),
-    the surrogate-target arm is about 8x cheaper per step, trains smooth with zero gradient
-    conflict, and beats the compound-loss arm on rollout rel-$L_2$ (0.0036 vs 0.0045). A
-    correction-field arm (error PDE $L[e] = r$, GT as constraint anchor only) wins outright
-    (0.0010). Q1 is therefore *feasible*: the surrogate machinery is justified.
+    the surrogate-target arm beats the compound-loss arm on rollout rel-$L_2$ (0.0039 vs 0.0045),
+    is about 8x cheaper per step, and trains smooth with zero gradient conflict. But on this
+    smooth toy (48 RBF centers) a ONE-SHOT Kansa RBF base (rel-$L_2$ 5e-4) already beats every
+    neural arm (rbf-grad 4e-4, v-star 4.6e-3, surrogate 3.9e-3, compound 4.5e-3), and classical
+    residual-gradient RBF refinement — isotropic (rbf-grad) or anisotropic (rbf-shape) — cannot
+    beat the base beyond noise: the residual landscape is sharply conditioned (kappa ~1e17), so
+    gradient refinement is only stable at step sizes too small to move the parameters. Only the
+    error-PDE correction field (`L[e] = -residual`, ground truth as constraint anchor) breaks
+    through, to 1e-4. The experiment isolates a conditioning/landscape finding; it does NOT settle
+    whether anisotropic learnable shapes help (the rbf-shape kernels did not move under the only
+    stable learning rate), which awaits a harder problem.
   ],
 )
 
@@ -134,10 +141,19 @@ base solve and surrogate span are physics-consistent (solver sign fix, see note)
 
 == Conclusions
 
-- **Q1 feasible = True.** Surrogate-target rel-$L_2$ 0.0036 (within the 0.012 budget), beats compound-loss
-  on rollout, under 1 s/step, smooth while compound oscillates with anti-aligned gradients.
-- **Oracle gate holds.** Surrogate in-span approximately 0.85, under the 0.90 collapse threshold —
-  predominantly out-of-span gain, so the corrector is non-vacuous.
+- **Surrogate-target beats compound-loss, narrowly.** rel-$L_2$ 0.0039 vs 0.0045, about 8x
+  cheaper per step, smooth with zero gradient conflict vs oscillating and anti-aligned
+  (grad-cos -0.98). Confirms the gradient-conflict diagnosis, but the absolute margin is small.
+- **On this smooth toy, nothing gradient/neural beats a one-shot Kansa base beyond noise.**
+  rbf-base 5e-4; rbf-grad 4e-4 and rbf-shape 4e-4 (within seed scatter); v-star 4.6e-3;
+  surrogate 3.9e-3; compound 4.5e-3. The residual landscape is sharply conditioned
+  (kappa ~1e17), so classical gradient-RBF refinement (isotropic or anisotropic) is stable only
+  at step sizes too small to move parameters — a conditioning/landscape finding echoing the
+  RBF-FD kappa-wall.
+- **Anisotropic-kernel verdict NOT established.** rbf-shape shapes did not move (kappa-stiff), so
+  whether learnable anisotropic shape helps remains open; it belongs on a harder problem.
+- **Best arm: correction-field (1e-4) via the error PDE** `L[e] = -residual`, GT as soft constraint
+  anchor — a different mechanism that breaks through the base where parameter refinement stalls.
 - **Oracle-leak audit:** {oracle}
 - **Note (reused machinery):** {fix}
 """

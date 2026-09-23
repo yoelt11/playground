@@ -195,4 +195,23 @@ def summarize_arm(
         out["v_star_rel_l2"] = result["v_star_rel_l2"]
     if "debug_pde_check" in result:
         out["debug_pde_check"] = result["debug_pde_check"]
+    # rbf-grad / rbf-shape train-moved + shape diagnostics (passthrough)
+    for key in (
+        "mean_weight_displacement",
+        "mean_center_displacement",
+        "mean_dlog_sigma",
+        "mean_dangle",
+        "shape_moved",
+        "shape_range",
+        "shape_collapsed",
+        "trained_non_vacuous",
+        "diverged",
+        "rel_l2_delta_vs_base",
+        "init_match_rel_err",
+        "lr",
+        "lr_shape",
+        "lr_centers",
+    ):
+        if key in result:
+            out[key] = result[key]
     return out

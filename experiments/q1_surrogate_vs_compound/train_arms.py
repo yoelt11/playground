@@ -9,7 +9,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from models import RBFField, SolutionNet, flat_grads, grad_cosine, laplacian
+from models import (
+    AnisotropicRBFField,
+    RBFField,
+    SolutionNet,
+    flat_grads,
+    grad_cosine,
+    laplacian,
+)
 from setup_data import ExperimentData, rel_l2, set_seeds, to_torch
 
 
@@ -518,4 +525,247 @@ def train_arm_rbf_grad(
         "model": model,
         "centers_final": model.centers.detach().cpu().numpy(),
         "weights_final": model.effective_weights.detach().cpu().numpy(),
+    }
+
+
+def train_arm_rbf_shape(
+    data: ExperimentData,
+    steps: int = 3000,
+    lr: float = 1e-3,
+    lr_centers: float | None = None,
+    lr_shape: float | None = None,
+    lambda_bc: float = 1e4,
+    eval_every: int = 50,
+) -> dict:
+    """Anisotropic learnable-shape RBF refine (ePIL/VSD kernel), same budget.
+
+    Seeds from the shared Kansa base so init == isotropic rbf-base / rbf-grad
+    at step 0. Trainable: centers μ, log σ_x, log σ_y, angle, O(1) w̃.
+    PDE residual via nested autograd Δ (no closed-form anisotropic Lap).
+
+    Reparam / lr (ported from rbf-grad)
+    -----------------------------------
+    σ_w = max(|w_base|) frozen; w̃ = w_base/σ_w O(1). Weight Adam group uses
+    lr_w = lr / σ_w so CFG `lr` is the effective |Δw| scale (same as rbf-grad;
+    keep ~2e-6). Shape params (log σ, angle) are already O(1) but the PDE
+    residual is extremely stiff in them: 1e-2..1e-3 diverge; largest stable
+    lr_shape ~1e-7 (default 5e-8). Centers use lr_centers (default 1e-8).
+    Anisotropic shape can worsen conditioning — note honestly if unstable.
+    """
+    set_seeds(data.seed)
+    model = AnisotropicRBFField(data.rbf_centers, data.u_base_weights, data.epsilon)
+    sigma_w = float(model.weight_scale.item())
+    if lr_centers is None:
+        lr_centers = 1e-8
+    if lr_shape is None:
+        lr_shape = 5e-8
+    opt = optim.Adam(
+        [
+            {"params": [model.weights], "lr": lr / max(sigma_w, 1e-30)},
+            {"params": [model.centers], "lr": lr_centers},
+            {
+                "params": [model.log_sigma_x, model.log_sigma_y, model.angles],
+                "lr": lr_shape,
+            },
+        ]
+    )
+
+    with torch.no_grad():
+        centers0 = model.centers.detach().clone()
+        w_eff0 = model.effective_weights.detach().clone()
+        w_norm0 = model.weights.detach().clone()
+        log_sx0 = model.log_sigma_x.detach().clone()
+        log_sy0 = model.log_sigma_y.detach().clone()
+        angles0 = model.angles.detach().clone()
+        # Init must reproduce u_base (anisotropic @ σ=1/(ε√2), angle=0).
+        u_init = _eval_model(model, data.grid)
+        rel_l2_init = rel_l2(u_init, data.u_exact)
+        init_match_err = float(
+            np.linalg.norm(u_init - data.u_base)
+            / max(np.linalg.norm(data.u_base), 1e-30)
+        )
+
+    x_int = torch.tensor(data.interior, dtype=torch.float64, requires_grad=True)
+    f_int = torch.tensor(data.f_interior, dtype=torch.float64).unsqueeze(-1)
+    x_bnd = torch.tensor(data.boundary_pts, dtype=torch.float64)
+    u_bnd = torch.tensor(data.u_bnd, dtype=torch.float64).unsqueeze(-1)
+    base_rel = rel_l2(data.u_base, data.u_exact)
+
+    hist = {
+        "loss": [],
+        "loss_phys": [],
+        "loss_bc": [],
+        "rel_l2": [],
+        "grad_cos": [],
+        "step": [],
+        "step_time": [],
+    }
+
+    model.train()
+    loss0_phys = None
+    diverged = False
+    for step in range(steps):
+        t0 = time.perf_counter()
+        opt.zero_grad(set_to_none=True)
+        # Nested autograd Δ: x is graph root; RBF params are Parameter leaves.
+        if not x_int.requires_grad:
+            x_int = x_int.detach().requires_grad_(True)
+        lap = laplacian(model, x_int)
+        phys = ((-lap - f_int) ** 2).mean()
+        bc = ((model(x_bnd) - u_bnd) ** 2).mean()
+        loss = phys + lambda_bc * bc
+        if not torch.isfinite(loss):
+            diverged = True
+            hist["loss"].append(float("nan"))
+            hist["loss_phys"].append(float("nan"))
+            hist["loss_bc"].append(float("nan"))
+            hist["grad_cos"].append(float("nan"))
+            hist["step"].append(step)
+            hist["step_time"].append(time.perf_counter() - t0)
+            hist["rel_l2"].append(float("nan"))
+            print(
+                f"    [rbf-shape] non-finite loss at step {step}; aborting refine "
+                f"(lr_eff={lr:g}, lr_shape={lr_shape:g}, lr_c={lr_centers:g})",
+                flush=True,
+            )
+            break
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            model.centers.clamp_(0.0, 1.0)
+            # Soft bound widths away from collapse / blow-up (κ-wall diagnostics).
+            model.log_sigma_x.clamp_(-8.0, 4.0)
+            model.log_sigma_y.clamp_(-8.0, 4.0)
+        dt = time.perf_counter() - t0
+
+        if step == 0:
+            loss0_phys = float(phys.item())
+
+        hist["loss"].append(float(loss.item()))
+        hist["loss_phys"].append(float(phys.item()))
+        hist["loss_bc"].append(float(bc.item()))
+        hist["grad_cos"].append(float("nan"))
+        hist["step"].append(step)
+        hist["step_time"].append(dt)
+
+        if step % eval_every == 0 or step == steps - 1:
+            hist["rel_l2"].append(rel_l2(_eval_model(model, data.grid), data.u_exact))
+            model.train()
+        else:
+            hist["rel_l2"].append(hist["rel_l2"][-1] if hist["rel_l2"] else float("nan"))
+
+    with torch.no_grad():
+        mean_w_disp = float(
+            torch.mean(torch.abs(model.effective_weights - w_eff0)).item()
+        )
+        mean_w_norm_disp = float(
+            torch.mean(torch.abs(model.weights - w_norm0)).item()
+        )
+        mean_c_disp = float(
+            torch.mean(torch.linalg.norm(model.centers - centers0, dim=-1)).item()
+        )
+        mean_dlog_sx = float(torch.mean(torch.abs(model.log_sigma_x - log_sx0)).item())
+        mean_dlog_sy = float(torch.mean(torch.abs(model.log_sigma_y - log_sy0)).item())
+        mean_dlog_sigma = 0.5 * (mean_dlog_sx + mean_dlog_sy)
+        mean_dangle = float(torch.mean(torch.abs(model.angles - angles0)).item())
+        sx = model.sigma_x.detach().cpu().numpy()
+        sy = model.sigma_y.detach().cpu().numpy()
+        ang = model.angles.detach().cpu().numpy()
+        aspect = np.maximum(sx, sy) / np.maximum(np.minimum(sx, sy), 1e-30)
+        shape_range = {
+            "sigma_x_min": float(sx.min()),
+            "sigma_x_max": float(sx.max()),
+            "sigma_y_min": float(sy.min()),
+            "sigma_y_max": float(sy.max()),
+            "angle_min": float(ang.min()),
+            "angle_max": float(ang.max()),
+            "aspect_max": float(aspect.max()),
+            "aspect_mean": float(aspect.mean()),
+            "sigma_iso_init": float(1.0 / (data.epsilon * np.sqrt(2.0))),
+        }
+        # Degeneration heuristic: widths collapsed or aspect extreme.
+        collapsed = bool(sx.min() < 1e-3 or sy.min() < 1e-3 or aspect.max() > 1e3)
+
+    u_final = _eval_model(model, data.grid)
+    final_rel = rel_l2(u_final, data.u_exact)
+    loss_final_phys = float(hist["loss_phys"][-1]) if hist["loss_phys"] else float("nan")
+    delta = base_rel - final_rel
+    beats_base = (not diverged) and final_rel < base_rel
+    resid_decreased = (
+        loss0_phys is not None
+        and np.isfinite(loss_final_phys)
+        and loss_final_phys < loss0_phys
+    )
+    shape_moved = mean_dlog_sigma > 1e-8 or mean_dangle > 1e-8
+    trained = (
+        (mean_w_disp > 1e-10 or mean_c_disp > 1e-10 or shape_moved)
+        and resid_decreased
+    )
+    lr_w_norm = lr / max(sigma_w, 1e-30)
+    print(
+        f"    [rbf-shape init] relL2={rel_l2_init:.4e} (==base {base_rel:.4e}); "
+        f"‖u_init−u_base‖/‖u_base‖={init_match_err:.3e} "
+        f"(must be ~0 for correct anisotropic kernel)",
+        flush=True,
+    )
+    print(
+        f"    [rbf-shape train-moved] mean|Δw|={mean_w_disp:.4e} "
+        f"mean|Δμ|={mean_c_disp:.4e} mean|Δlogσ|={mean_dlog_sigma:.4e} "
+        f"mean|Δangle|={mean_dangle:.4e} (shape_moved={shape_moved}, "
+        f"non_vacuous={trained}); σ_w={sigma_w:.4e}; "
+        f"lr_eff={lr:g} lr_shape={lr_shape:g} lr_w̃={lr_w_norm:.4e} "
+        f"lr_c={lr_centers:g}",
+        flush=True,
+    )
+    print(
+        f"    [rbf-shape sanity] phys-loss {loss0_phys:.4e} → {loss_final_phys:.4e} "
+        f"(decreased={resid_decreased}); "
+        f"relL2 before={rel_l2_init:.4e} → after={final_rel:.4e} "
+        f"(Δ={delta:+.4e}, beats_base={beats_base}); diverged={diverged}; "
+        f"σx∈[{shape_range['sigma_x_min']:.3e},{shape_range['sigma_x_max']:.3e}] "
+        f"σy∈[{shape_range['sigma_y_min']:.3e},{shape_range['sigma_y_max']:.3e}] "
+        f"angle∈[{shape_range['angle_min']:.3e},{shape_range['angle_max']:.3e}] "
+        f"aspect_max={shape_range['aspect_max']:.3e} collapsed={collapsed}",
+        flush=True,
+    )
+    return {
+        "arm": "rbf-shape",
+        "u_pred": u_final,
+        "history": hist,
+        "final_rel_l2": final_rel,
+        "base_rel_l2": base_rel,
+        "rel_l2_init": float(rel_l2_init),
+        "init_match_rel_err": float(init_match_err),
+        "rel_l2_delta_vs_base": float(delta),
+        "beats_base": bool(beats_base),
+        "phys_loss_initial": float(loss0_phys) if loss0_phys is not None else float("nan"),
+        "phys_loss_final": loss_final_phys,
+        "phys_loss_decreased": bool(resid_decreased),
+        "mean_weight_displacement": mean_w_disp,
+        "mean_weight_norm_displacement": mean_w_norm_disp,
+        "mean_center_displacement": mean_c_disp,
+        "mean_dlog_sigma": mean_dlog_sigma,
+        "mean_dangle": mean_dangle,
+        "shape_moved": bool(shape_moved),
+        "shape_range": shape_range,
+        "shape_collapsed": bool(collapsed),
+        "weight_scale": sigma_w,
+        "trained_non_vacuous": bool(trained),
+        "diverged": bool(diverged),
+        "mean_step_time": float(np.nanmean(hist["step_time"]))
+        if hist["step_time"]
+        else float("nan"),
+        "mean_grad_cos": float("nan"),
+        "late_grad_cos": float("nan"),
+        "lr": float(lr),
+        "lr_shape": float(lr_shape),
+        "lr_weight_norm": float(lr_w_norm),
+        "lr_centers": float(lr_centers),
+        "lambda_bc": float(lambda_bc),
+        "model": model,
+        "centers_final": model.centers.detach().cpu().numpy(),
+        "weights_final": model.effective_weights.detach().cpu().numpy(),
+        "log_sigma_x_final": model.log_sigma_x.detach().cpu().numpy(),
+        "log_sigma_y_final": model.log_sigma_y.detach().cpu().numpy(),
+        "angles_final": model.angles.detach().cpu().numpy(),
     }

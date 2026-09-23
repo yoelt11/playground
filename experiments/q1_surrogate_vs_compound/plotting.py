@@ -25,11 +25,12 @@ def _apply_style() -> None:
 
 
 def plot_corrected_kill_table(agg: dict, out_dir: Path) -> None:
-    """Bar chart of rel-L2 mean±std for the 6-row corrected kill table."""
+    """Bar chart of rel-L2 mean±std for the 7-row corrected kill table."""
     _apply_style()
     order = [
         "rbf-base",
         "rbf-grad",
+        "rbf-shape",
         "v-star",
         "surrogate-target",
         "compound-loss",
@@ -38,6 +39,7 @@ def plot_corrected_kill_table(agg: dict, out_dir: Path) -> None:
     colors = {
         "rbf-base": "#7f8c8d",
         "rbf-grad": "#d35400",
+        "rbf-shape": "#e67e22",
         "v-star": "#8e44ad",
         "surrogate-target": "#2980b9",
         "compound-loss": "#c0392b",
@@ -45,7 +47,7 @@ def plot_corrected_kill_table(agg: dict, out_dir: Path) -> None:
     }
     means = [float(np.nanmean(agg[a]["rel_l2"])) for a in order]
     stds = [float(np.nanstd(agg[a]["rel_l2"])) for a in order]
-    fig, ax = plt.subplots(figsize=(9.5, 3.8))
+    fig, ax = plt.subplots(figsize=(10.5, 3.8))
     x = np.arange(len(order))
     ax.bar(
         x,
@@ -74,9 +76,10 @@ def plot_training_curves(
 ) -> None:
     """loss + relL2 + grad conflict vs step for each arm (mean over seeds)."""
     _apply_style()
-    arms = ["rbf-grad", "compound-loss", "surrogate-target", "correction-field"]
+    arms = ["rbf-grad", "rbf-shape", "compound-loss", "surrogate-target", "correction-field"]
     colors = {
         "rbf-grad": "#d35400",
+        "rbf-shape": "#e67e22",
         "compound-loss": "#c0392b",
         "surrogate-target": "#2980b9",
         "correction-field": "#27ae60",
