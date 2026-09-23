@@ -25,10 +25,11 @@ def _apply_style() -> None:
 
 
 def plot_corrected_kill_table(agg: dict, out_dir: Path) -> None:
-    """Bar chart of rel-L2 mean±std for the 5-row corrected kill table."""
+    """Bar chart of rel-L2 mean±std for the 6-row corrected kill table."""
     _apply_style()
     order = [
         "rbf-base",
+        "rbf-grad",
         "v-star",
         "surrogate-target",
         "compound-loss",
@@ -36,6 +37,7 @@ def plot_corrected_kill_table(agg: dict, out_dir: Path) -> None:
     ]
     colors = {
         "rbf-base": "#7f8c8d",
+        "rbf-grad": "#d35400",
         "v-star": "#8e44ad",
         "surrogate-target": "#2980b9",
         "compound-loss": "#c0392b",
@@ -43,7 +45,7 @@ def plot_corrected_kill_table(agg: dict, out_dir: Path) -> None:
     }
     means = [float(np.nanmean(agg[a]["rel_l2"])) for a in order]
     stds = [float(np.nanstd(agg[a]["rel_l2"])) for a in order]
-    fig, ax = plt.subplots(figsize=(8.5, 3.8))
+    fig, ax = plt.subplots(figsize=(9.5, 3.8))
     x = np.arange(len(order))
     ax.bar(
         x,
@@ -72,8 +74,9 @@ def plot_training_curves(
 ) -> None:
     """loss + relL2 + grad conflict vs step for each arm (mean over seeds)."""
     _apply_style()
-    arms = ["compound-loss", "surrogate-target", "correction-field"]
+    arms = ["rbf-grad", "compound-loss", "surrogate-target", "correction-field"]
     colors = {
+        "rbf-grad": "#d35400",
         "compound-loss": "#c0392b",
         "surrogate-target": "#2980b9",
         "correction-field": "#27ae60",
@@ -91,8 +94,12 @@ def plot_training_curves(
             # Pad to common length
             mlen = min(len(s) for s in series)
             arr = np.stack([s[:mlen] for s in series], axis=0)
-            mean = arr.mean(axis=0)
-            std = arr.std(axis=0)
+            if key == "grad_cos" and np.all(np.isnan(arr)):
+                continue  # rbf-grad: n/a column
+            mean = np.nanmean(arr, axis=0)
+            std = np.nanstd(arr, axis=0)
+            if np.all(np.isnan(mean)):
+                continue
             steps = np.arange(mlen)
             ax.plot(steps, mean, color=colors[arm], label=arm, lw=1.6)
             ax.fill_between(steps, mean - std, mean + std, color=colors[arm], alpha=0.15)

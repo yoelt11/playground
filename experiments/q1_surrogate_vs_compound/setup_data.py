@@ -28,6 +28,7 @@ class ExperimentData:
     rbf_centers: np.ndarray
     epsilon: float
     u_base: np.ndarray
+    u_base_weights: np.ndarray
     residual_base: np.ndarray
     v_star: np.ndarray
     theta_star: np.ndarray
@@ -94,10 +95,11 @@ def build_experiment(
     cent_local = rng.choice(len(interior), size=n_cent, replace=False)
     rbf_centers = interior[cent_local]
 
-    # Base solve (Arm 3 freeze + span reference)
+    # Base solve (Arm 3 freeze + span reference; also seeds rbf-grad)
     base = RBFKansaSolver(epsilon=epsilon)
     base.fit(rbf_centers, pde.f_exact(rbf_centers), boundary_pts, u_bnd)
     u_base = base.predict(grid)
+    u_base_weights = np.asarray(base.weights, dtype=float)
     residual_base = base.compute_residual(interior, f_interior)
 
     # Surrogate target v* in RBF span (Arm 2)
@@ -132,6 +134,7 @@ def build_experiment(
         rbf_centers=rbf_centers,
         epsilon=epsilon,
         u_base=u_base,
+        u_base_weights=u_base_weights,
         residual_base=residual_base,
         v_star=v_star,
         theta_star=theta_star,

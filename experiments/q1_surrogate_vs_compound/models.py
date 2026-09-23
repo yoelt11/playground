@@ -1,4 +1,4 @@
-"""Shared MLP and autograd Laplacian for Arms 1–3."""
+"""Shared MLP, RBF field, and autograd Laplacian for Q1 arms."""
 
 from __future__ import annotations
 
@@ -6,6 +6,66 @@ import math
 
 import torch
 import torch.nn as nn
+
+
+class RBFField(nn.Module):
+    """Gaussian RBF expansion with trainable centers + O(1) weights (ε fixed).
+
+    u(x) = Σ_j (σ · w̃_j) exp(−ε² ‖x − c_j‖²), where σ = max(|w_base|) is a
+    frozen scale and w̃ = w_base / σ are O(1) trainable normalized weights.
+    At init, σ · w̃ = w_base so the field matches the one-shot Kansa solution
+    exactly; Adam sees O(1) parameters (centers + w̃) and can use a sane lr.
+
+    Matches the Kansa / splat rbf-grad setup: centers and (normalized) weights
+    are Adam-refined; epsilon and σ are frozen. Uses float64 so inheritance
+    from the O(10^6) Kansa solve is not destroyed by float32 rounding.
+    """
+
+    def __init__(self, centers, weights, epsilon: float):
+        super().__init__()
+        w = torch.as_tensor(weights, dtype=torch.float64).reshape(-1).clone()
+        sigma = float(torch.max(torch.abs(w)).item())
+        if sigma < 1e-30:
+            sigma = 1.0
+        self.register_buffer(
+            "weight_scale", torch.tensor(sigma, dtype=torch.float64)
+        )
+        self.centers = nn.Parameter(
+            torch.as_tensor(centers, dtype=torch.float64).clone()
+        )
+        # Trainable O(1) normalized weights; effective w = σ · w̃
+        self.weights = nn.Parameter(w / sigma)
+        self.register_buffer(
+            "epsilon", torch.tensor(float(epsilon), dtype=torch.float64)
+        )
+
+    @property
+    def effective_weights(self) -> torch.Tensor:
+        return self.weight_scale * self.weights
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, 2) → (N, 1)
+        if x.dtype != torch.float64:
+            x = x.double()
+        diff = x.unsqueeze(1) - self.centers.unsqueeze(0)  # (N, K, 2)
+        r2 = (diff * diff).sum(dim=-1)  # (N, K)
+        phi = torch.exp(-(self.epsilon ** 2) * r2)
+        return (phi @ self.effective_weights).unsqueeze(-1)
+
+    def laplacian(self, x: torch.Tensor) -> torch.Tensor:
+        """Analytical Δu for Gaussian RBFs (matches common.laplacian_gaussian_rbf).
+
+        Δφ_j = (4 a² r² − 4 a) exp(−a r²), a=ε²; Δu = Σ_j (σ w̃_j) Δφ_j.
+        Prefer this over nested autograd for residual training — same formula as
+        the Kansa operator, cleaner grads w.r.t. centers/weights.
+        """
+        if x.dtype != torch.float64:
+            x = x.double()
+        diff = x.unsqueeze(1) - self.centers.unsqueeze(0)  # (N, K, 2)
+        r2 = (diff * diff).sum(dim=-1)  # (N, K)
+        a = self.epsilon ** 2
+        lap_phi = (4.0 * (a ** 2) * r2 - 4.0 * a) * torch.exp(-a * r2)
+        return (lap_phi @ self.effective_weights).unsqueeze(-1)
 
 
 class SolutionNet(nn.Module):

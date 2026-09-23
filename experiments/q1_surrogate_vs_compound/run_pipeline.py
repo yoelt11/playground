@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Q1 probe entrypoint: 5-row honest kill table after oracle correctness fixes.
+"""Q1 probe entrypoint: 6-row honest kill table after oracle correctness fixes.
 
-Rows (order): rbf-base, v-star, surrogate-target, compound-loss, correction-field.
+Rows (order): rbf-base, rbf-grad, v-star, surrogate-target, compound-loss,
+correction-field.
 
 Run:
     .venv/bin/python run_pipeline.py
@@ -27,7 +28,12 @@ from plotting import (
     plot_training_curves,
 )
 from setup_data import build_experiment, rel_l2
-from train_arms import train_arm1_compound, train_arm2_surrogate, train_arm3_correction
+from train_arms import (
+    train_arm1_compound,
+    train_arm2_surrogate,
+    train_arm3_correction,
+    train_arm_rbf_grad,
+)
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
@@ -36,6 +42,7 @@ FIGURES = ROOT / "figures"
 # Kill-table row order (required).
 ARM_ORDER = [
     "rbf-base",
+    "rbf-grad",
     "v-star",
     "surrogate-target",
     "compound-loss",
@@ -51,13 +58,18 @@ CFG = {
     "epsilon": 1.5,
     "alpha": 1.0,
     "beta": 80.0,
-    "steps": 3000,  # shared step budget across neural arms
+    "steps": 3000,  # shared step budget across neural + rbf-grad arms
     "lambda_data": 500.0,
     "lambda_anchor": 5.0,
+    "lambda_bc_rbf_grad": 1e4,  # match Kansa BC weight
     "width": 128,
     "lr_arm1": 2e-3,
     "lr_arm2": 5e-3,
     "lr_arm3": 2e-3,
+    # O(1) reparam w̃=w/σ; Adam lr on w̃ is lr/σ so CFG lr = effective |Δw| scale.
+    # 1e-2/5e-3/1e-3 on w̃ diverge (Δw_eff≈σ·lr). Largest stable effective lr ~2e-6.
+    "lr_rbf_grad": 2e-6,
+    "lr_rbf_grad_centers": 1e-8,
     "colloc_batch": 512,
     "eval_every": 50,
 }
@@ -106,6 +118,27 @@ def _fmt_cond(ranks: list, conds: list, ridges: list) -> str:
     )
 
 
+def _rbf_grad_noise_gate(agg: dict) -> dict:
+    """Honest significance: mean sep must exceed pooled std across seeds."""
+    base_arr = np.asarray(agg["rbf-base"]["rel_l2"], dtype=float)
+    rbfg_arr = np.asarray(agg["rbf-grad"]["rel_l2"], dtype=float)
+    base_m = float(np.mean(base_arr))
+    base_s = float(np.std(base_arr))
+    rbfg_m = float(np.mean(rbfg_arr))
+    rbfg_s = float(np.std(rbfg_arr))
+    sep = base_m - rbfg_m  # >0 ⇒ rbf-grad mean better (lower rel-L2)
+    pooled_std = float(np.sqrt(base_s**2 + rbfg_s**2))
+    return {
+        "rbf_base_mean": base_m,
+        "rbf_base_std": base_s,
+        "rbf_grad_mean": rbfg_m,
+        "rbf_grad_std": rbfg_s,
+        "sep": sep,
+        "pooled_std": pooled_std,
+        "beats_beyond_noise": bool(sep > pooled_std),
+    }
+
+
 def print_kill_table(agg: dict) -> str:
     header = (
         f"{'arm':<20} {'relL2':<16} {'s/step':<12} {'grad-cos':<14} "
@@ -115,14 +148,18 @@ def print_kill_table(agg: dict) -> str:
     lines = [
         "",
         "=" * len(header),
-        "Q1 CORRECTED KILL TABLE (5 rows)",
+        "Q1 CORRECTED KILL TABLE (6 rows)",
         "=" * len(header),
         header,
         sep,
     ]
     for arm in ARM_ORDER:
         a = agg[arm]
-        grad = _mean_std(a["grad_cos"]) if arm not in ("rbf-base", "v-star") else "n/a"
+        grad = (
+            _mean_std(a["grad_cos"])
+            if arm not in ("rbf-base", "rbf-grad", "v-star")
+            else "n/a"
+        )
         step = _mean_std(a["step_time"]) if arm not in ("rbf-base", "v-star") else "n/a"
         span = _fmt_span(a["in_span"], a["out_span"])
         cond = (
@@ -154,7 +191,14 @@ def print_kill_table(agg: dict) -> str:
         "MLP ~0.85 in-span is regression residual, NOT out-of-span gain."
     )
 
-    base_m = float(np.mean(agg["rbf-base"]["rel_l2"]))
+    gate = _rbf_grad_noise_gate(agg)
+    base_m = gate["rbf_base_mean"]
+    base_s = gate["rbf_base_std"]
+    rbfg_m = gate["rbf_grad_mean"]
+    rbfg_s = gate["rbf_grad_std"]
+    sep = gate["sep"]
+    pooled_std = gate["pooled_std"]
+    beats_beyond_noise = gate["beats_beyond_noise"]
     vstar_m = float(np.mean(agg["v-star"]["rel_l2"]))
     surr_m = float(np.mean(agg["surrogate-target"]["rel_l2"]))
     comp_m = float(np.mean(agg["compound-loss"]["rel_l2"]))
@@ -162,19 +206,43 @@ def print_kill_table(agg: dict) -> str:
     neural = {"surrogate-target": surr_m, "compound-loss": comp_m, "correction-field": corr_m}
     best_neural_name = min(neural, key=neural.get)
     best_neural = neural[best_neural_name]
-    if base_m <= best_neural:
+    lines.append(
+        f"rbf-grad beats base beyond noise: {beats_beyond_noise} "
+        f"(sep={sep:+.4e}, pooled_std={pooled_std:.4e}; "
+        f"rbf-grad={rbfg_m:.4e}±{rbfg_s:.4e} vs rbf-base={base_m:.4e}±{base_s:.4e})"
+    )
+    if beats_beyond_noise:
+        grad_vs = (
+            f"rbf-grad ({rbfg_m:.4e}±{rbfg_s:.4e}) beats one-shot base "
+            f"({base_m:.4e}±{base_s:.4e}) beyond noise (sep={sep:+.4e} > "
+            f"pooled_std={pooled_std:.4e})."
+        )
+    elif sep > 0:
+        grad_vs = (
+            f"rbf-grad mean ({rbfg_m:.4e}±{rbfg_s:.4e}) is numerically below base "
+            f"({base_m:.4e}±{base_s:.4e}) but NOT beyond noise "
+            f"(sep={sep:+.4e} ≤ pooled_std={pooled_std:.4e}) — within seed scatter."
+        )
+    else:
+        grad_vs = (
+            f"rbf-grad ({rbfg_m:.4e}±{rbfg_s:.4e}) does NOT beat one-shot base "
+            f"({base_m:.4e}±{base_s:.4e}; sep={sep:+.4e}, "
+            f"pooled_std={pooled_std:.4e}) — residual-gradient center refine "
+            "is not free accuracy on this toy."
+        )
+    if base_m <= best_neural and rbfg_m <= best_neural:
         base_vs = (
-            f"RBF base ({base_m:.4e}) already beats neural arms "
+            f"Classical RBF rows already beat neural arms "
             f"(best={best_neural_name} {best_neural:.4e}) on this smooth toy."
         )
     else:
         base_vs = (
-            f"RBF base ({base_m:.4e}); best neural={best_neural_name} "
-            f"({best_neural:.4e}) — correction may beat base after sign fix."
+            f"best neural={best_neural_name} ({best_neural:.4e}); "
+            f"base={base_m:.4e}; rbf-grad={rbfg_m:.4e}."
         )
     lines.append(
         f"Framing: analytic projection is a stable distill target "
-        f"(v*={vstar_m:.4e} → MLP={surr_m:.4e}); {base_vs}"
+        f"(v*={vstar_m:.4e} → MLP={surr_m:.4e}); {grad_vs} {base_vs}"
     )
     lines.append(
         "Oracle-leak (Arm3): GT is a soft constraint anchor only; "
@@ -220,6 +288,27 @@ def run_seed(seed: int) -> dict:
         f"  Arm0 rbf-base: relL2={s0['final_rel_l2']:.4e}",
         flush=True,
     )
+
+    r_grad = train_arm_rbf_grad(
+        data,
+        steps=CFG["steps"],
+        lr=CFG["lr_rbf_grad"],
+        lr_centers=CFG["lr_rbf_grad_centers"],
+        lambda_bc=CFG["lambda_bc_rbf_grad"],
+        eval_every=CFG["eval_every"],
+        colloc_batch=CFG["colloc_batch"],
+    )
+    print(
+        f"  Arm0b rbf-grad: relL2={r_grad['final_rel_l2']:.4e} "
+        f"(base={r_grad['base_rel_l2']:.4e}, "
+        f"Δ={r_grad['rel_l2_delta_vs_base']:+.4e}, "
+        f"lr_eff={r_grad['lr']:g}, lr_c={r_grad['lr_centers']:g}, "
+        f"mean|Δw|={r_grad['mean_weight_displacement']:.3e}, "
+        f"mean|Δc|={r_grad['mean_center_displacement']:.3e}) "
+        f"s/step={r_grad['mean_step_time']:.3f}",
+        flush=True,
+    )
+
     print(
         f"  Arm2a v-star: relL2={s_v['final_rel_l2']:.4e} "
         f"span(a) in={s_v['span_vstar_minus_base']['in_span_frac']:.3f}",
@@ -284,12 +373,14 @@ def run_seed(seed: int) -> dict:
             flush=True,
         )
 
+    s_grad = summarize_arm(r_grad, data, compute_span=True)
     s1 = summarize_arm(r1, data, compute_span=True)
     s2 = summarize_arm(r2, data, compute_span=True)
     s3 = summarize_arm(r3, data, compute_span=True)
 
     arm_preds = {
         "rbf-base": data.u_base,
+        "rbf-grad": r_grad["u_pred"],
         "v-star": data.v_star,
         "compound-loss": r1["u_pred"],
         "surrogate-target": r2["u_pred"],
@@ -300,6 +391,7 @@ def run_seed(seed: int) -> dict:
         data,
         {
             "rbf-base": data.u_base,
+            "rbf-grad": r_grad["u_pred"],
             "v-star": data.v_star,
             "compound-loss": r1["u_pred"],
             "surrogate-target": r2["u_pred"],
@@ -312,8 +404,10 @@ def run_seed(seed: int) -> dict:
     elapsed = time.perf_counter() - t0
     print(f"  seed {seed} done in {elapsed:.1f}s", flush=True)
 
-    for r in (r1, r2, r3):
+    for r in (r_grad, r1, r2, r3):
         r.pop("model", None)
+        r.pop("centers_final", None)
+        r.pop("weights_final", None)
 
     return {
         "seed": seed,
@@ -328,6 +422,7 @@ def run_seed(seed: int) -> dict:
                 "history": {"loss": [], "rel_l2": [], "grad_cos": [], "step_time": []},
                 "summary": s0,
             },
+            "rbf-grad": {**r_grad, "summary": s_grad},
             "v-star": {
                 "arm": "v-star",
                 "u_pred": data.v_star,
@@ -341,6 +436,7 @@ def run_seed(seed: int) -> dict:
         },
         "summaries": {
             "rbf-base": s0,
+            "rbf-grad": s_grad,
             "v-star": s_v,
             "compound-loss": s1,
             "surrogate-target": s2,
@@ -498,9 +594,25 @@ def main() -> int:
         "kill_table_text": kill_text,
         "framing": (
             "Q1 narrows to: an analytic function-space projection is a stable "
-            "distillation target for a neural surrogate; the RBF base itself "
-            "already beats the neural arms on this smooth toy."
+            "distillation target for a neural surrogate; the classical RBF rows "
+            "(one-shot Kansa + residual-gradient refine) already beat the neural "
+            "arms on this smooth toy. rbf-grad asks whether Adam center/weight "
+            "refinement beats the one-shot Kansa base under the same step budget, "
+            "with O(1) weight reparam (σ·w̃) so training is non-vacuous; "
+            "claim 'beats base' only if mean sep > pooled std."
         ),
+        "rbf_grad_note": (
+            f"rbf-grad: O(1) reparam w̃=w_base/σ (σ=max(|w_base|) frozen; "
+            f"u=Σ (σ·w̃)φ); Adam lr_eff={CFG['lr_rbf_grad']} on weights "
+            f"(lr_w̃=lr_eff/σ), lr_centers={CFG['lr_rbf_grad_centers']}; "
+            f"1e-2/5e-3/1e-3 on w̃ diverge because Δw_eff≈σ·lr. "
+            f"Analytical Δ; lambda_bc={CFG['lambda_bc_rbf_grad']}, "
+            f"steps={CFG['steps']}; float64; seeded from shared Kansa "
+            "centers+weights (ε fixed); full-interior collocation. "
+            "grad-cos / ridge columns are n/a. "
+            "beats-base gated by sep > pooled_std across seeds."
+        ),
+        "rbf_grad_beats_base_beyond_noise": _rbf_grad_noise_gate(agg),
         "oracle_leak_audit": (
             "Arm3: GT only as soft constraint anchor ‖(u_base+e_hat)-u*‖_GT; "
             "primary loss is ‖L[e_hat]+residual‖² with residual=L[u_base]−f "
