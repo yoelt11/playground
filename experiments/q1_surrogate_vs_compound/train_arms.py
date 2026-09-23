@@ -174,6 +174,44 @@ def train_arm2_surrogate(
     }
 
 
+def _debug_corrected_residual(
+    e_net: nn.Module,
+    data: ExperimentData,
+    n_check: int = 256,
+) -> dict:
+    """Verify L[u_base + e_hat] - f is driven toward zero on interior collocation.
+
+    residual_base = L[u_base] - f = (−Δu_base − f). With L[e_hat] = −residual,
+    L[u_base + e_hat] − f = residual + L[e_hat] ≈ 0.
+    """
+    e_net.eval()
+    rng = np.random.default_rng(data.seed + 99)
+    n = min(n_check, len(data.interior))
+    idx = rng.choice(len(data.interior), size=n, replace=False)
+    x_int = to_torch(data.interior[idx], requires_grad=True)
+    residual = to_torch(data.residual_base[idx]).unsqueeze(-1)
+
+    lap_e = laplacian(e_net, x_int)
+    # L[e] = −Δe; target L[e] = −residual ⇒ (−lap_e + residual) → 0
+    err_pde = (-lap_e + residual).detach().cpu().numpy().reshape(-1)
+    # Full corrected residual: L[u_base]+L[e]−f = residual + L[e]
+    L_e = (-lap_e).detach().cpu().numpy().reshape(-1)
+    corrected = data.residual_base[idx] + L_e
+    base_abs = float(np.mean(np.abs(data.residual_base[idx])))
+    corr_abs = float(np.mean(np.abs(corrected)))
+    return {
+        "mean_abs_residual_base": base_abs,
+        "mean_abs_L_u_corrected_minus_f": corr_abs,
+        "mean_abs_L_e_plus_residual": float(np.mean(np.abs(err_pde))),
+        "reduction_ratio": corr_abs / max(base_abs, 1e-30),
+        "n_check": int(n),
+        "note": (
+            "L[u_base+e_hat]-f should shrink vs |residual_base|; "
+            "reduction_ratio < 1 means the sign-fixed error PDE is helping."
+        ),
+    }
+
+
 def train_arm3_correction(
     data: ExperimentData,
     steps: int = 3000,
@@ -186,7 +224,9 @@ def train_arm3_correction(
     """Arm 3: freeze u_base; learn e_hat on error PDE; GT only as constraint anchor.
 
     Oracle-leak enforcement:
-      - Primary training target is L[e_hat] = residual (= −Δu_base − f).
+      - residual := L[u_base] − f = (−Δu_base − f).
+      - Correct error PDE: L[e_hat] = f − L[u_base] = −residual
+        (so L[u_base + e_hat] = f). Trained via ‖−Δe_hat + residual‖².
       - GT enters ONLY via soft anchor ‖(u_base + e_hat) − u*‖ at GT pts.
       - We never regress e_hat onto (u* − u_base) as the sole/primary loss.
     """
@@ -224,7 +264,8 @@ def train_arm3_correction(
         opt.zero_grad(set_to_none=True)
 
         lap_e = laplacian(e_net, x_int)
-        pde_loss = ((-lap_e - residual) ** 2).mean()
+        # Sign fix: fit L[e_hat] = −residual  ⇒  (−Δe + residual) → 0
+        pde_loss = ((-lap_e + residual) ** 2).mean()
         e_gt = e_net(x_gt)
         anchor = ((u_base_gt + e_gt - u_gt) ** 2).mean()
 
@@ -258,6 +299,13 @@ def train_arm3_correction(
 
     e_final = _eval_model(e_net, data.grid)
     u_final = u_base_grid + e_final
+    debug_pde = _debug_corrected_residual(e_net, data)
+    print(
+        f"    [arm3 PDE check] |L[u_base]-f|={debug_pde['mean_abs_residual_base']:.4e} → "
+        f"|L[u_base+e]-f|={debug_pde['mean_abs_L_u_corrected_minus_f']:.4e} "
+        f"(ratio={debug_pde['reduction_ratio']:.3f})",
+        flush=True,
+    )
     return {
         "arm": "correction-field",
         "u_pred": u_final,
@@ -269,9 +317,11 @@ def train_arm3_correction(
         "mean_grad_cos": float(np.mean(hist["grad_cos"])),
         "late_grad_cos": float(np.mean(hist["grad_cos"][len(hist["grad_cos"]) // 2 :])),
         "model": e_net,
+        "debug_pde_check": debug_pde,
         "oracle_leak_audit": (
             "GT used only as soft constraint anchor "
-            "‖(u_base+e_hat)-u*‖_GT; primary target is L[e_hat]=residual. "
-            "Never trained e_hat ← (u*-u_base) as sole regression target."
+            "‖(u_base+e_hat)-u*‖_GT; primary target is L[e_hat]=−residual "
+            "(residual=L[u_base]−f). Never trained e_hat ← (u*-u_base) as sole "
+            "regression target."
         ),
     }

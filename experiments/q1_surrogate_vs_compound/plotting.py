@@ -24,6 +24,48 @@ def _apply_style() -> None:
     )
 
 
+def plot_corrected_kill_table(agg: dict, out_dir: Path) -> None:
+    """Bar chart of rel-L2 mean±std for the 5-row corrected kill table."""
+    _apply_style()
+    order = [
+        "rbf-base",
+        "v-star",
+        "surrogate-target",
+        "compound-loss",
+        "correction-field",
+    ]
+    colors = {
+        "rbf-base": "#7f8c8d",
+        "v-star": "#8e44ad",
+        "surrogate-target": "#2980b9",
+        "compound-loss": "#c0392b",
+        "correction-field": "#27ae60",
+    }
+    means = [float(np.nanmean(agg[a]["rel_l2"])) for a in order]
+    stds = [float(np.nanstd(agg[a]["rel_l2"])) for a in order]
+    fig, ax = plt.subplots(figsize=(8.5, 3.8))
+    x = np.arange(len(order))
+    ax.bar(
+        x,
+        means,
+        yerr=stds,
+        color=[colors[a] for a in order],
+        capsize=4,
+        edgecolor="black",
+        linewidth=0.6,
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(order, rotation=15, ha="right")
+    ax.set_ylabel("rel-L2 (rollout)")
+    ax.set_title("Q1 corrected kill table — rel-L2 mean±std over seeds")
+    ax.set_yscale("log")
+    for i, (m, s) in enumerate(zip(means, stds)):
+        ax.text(i, m * 1.15, f"{m:.2e}", ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_dir / "corrected_kill_table.png", dpi=140)
+    plt.close(fig)
+
+
 def plot_training_curves(
     seed_results: list[dict],
     out_dir: Path,
