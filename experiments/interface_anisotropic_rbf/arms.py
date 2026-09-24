@@ -1,4 +1,4 @@
-"""JAX arms for interface_anisotropic_rbf (6-row kill table)."""
+"""JAX arms for interface_anisotropic_rbf (7-row kill table)."""
 
 from __future__ import annotations
 
@@ -909,3 +909,110 @@ def train_compound_loss(
 
     u_final = np.asarray(apply({"params": params}, grid))
     return _pack_metrics("compound-loss", u_final, data, hist)
+
+
+def train_compound_vstar(
+    data: ExperimentData,
+    steps: int = 1500,
+    lr: float = 2e-3,
+    width: int = 64,
+    lambda_vstar: float = 500.0,
+    eval_every: int = 50,
+    colloc_batch: int = 256,
+) -> dict:
+    """Compound ‖L[u]−f‖² + λ‖u−v*‖²; data term pins to analytic projection v*."""
+    key = jax.random.PRNGKey(data.seed + 5)
+    model = SolutionMLP(width=width)
+    params = model.init(key, jnp.zeros((1, 2)))["params"]
+    opt = optax.adam(lr)
+    opt_state = opt.init(params)
+    apply = model.apply
+
+    x_gt = jnp.asarray(data.gt_pts)
+    # v* lives on the eval grid; subsample at GT indices (mirror u_gt = u*|_GT).
+    v_star_gt = jnp.asarray(data.v_star[data.gt_idx])
+    interior = jnp.asarray(data.interior)
+    f_int = jnp.asarray(data.f_interior)
+    kappa_int = jnp.asarray(data.kappa_interior)
+    grid = jnp.asarray(data.grid)
+    rng = np.random.default_rng(data.seed + 7)
+    n_int = len(data.interior)
+
+    def parts(p, idx):
+        x = interior[idx]
+        f = f_int[idx]
+        kap = kappa_int[idx]
+        lap = _mlp_laplacian(lambda pp, xx: apply({"params": pp}, xx), p, x)
+        phys = jnp.mean((-kap * lap - f) ** 2)
+        data_term = jnp.mean((apply({"params": p}, x_gt) - v_star_gt) ** 2)
+        return phys, data_term
+
+    @jax.jit
+    def train_step(p, st, idx):
+        def total(pp):
+            phys, dat = parts(pp, idx)
+            return phys + lambda_vstar * dat, (phys, dat)
+
+        (loss, (phys, dat)), grads = jax.value_and_grad(total, has_aux=True)(p)
+        updates, st = opt.update(grads, st, p)
+        p = optax.apply_updates(p, updates)
+        return p, st, loss, phys, dat
+
+    hist = {
+        "loss": [],
+        "loss_phys": [],
+        "loss_data": [],
+        "rel_l2": [],
+        "rel_l2_band": [],
+        "grad_cos": [],
+        "step": [],
+        "step_time": [],
+    }
+    for s in range(steps):
+        t0 = time.perf_counter()
+        idx = rng.choice(n_int, size=min(colloc_batch, n_int), replace=False)
+        idx_j = jnp.asarray(idx)
+        params, opt_state, loss, phys, dat = train_step(params, opt_state, idx_j)
+        dt = time.perf_counter() - t0
+        if s % eval_every == 0:
+            g_p = jax.grad(lambda pp: parts(pp, idx_j)[0])(params)
+            g_d = jax.grad(lambda pp: parts(pp, idx_j)[1])(params)
+            cos = _grad_cosine(g_p, g_d)
+        else:
+            cos = float("nan")
+        hist["loss"].append(float(loss))
+        hist["loss_phys"].append(float(phys))
+        hist["loss_data"].append(float(dat))
+        hist["grad_cos"].append(float(cos) if cos == cos else float("nan"))
+        hist["step"].append(s)
+        hist["step_time"].append(dt)
+        if s % eval_every == 0 or s == steps - 1:
+            u_now = np.asarray(apply({"params": params}, grid))
+            hist["rel_l2"].append(rel_l2(u_now, data.u_exact))
+            hist["rel_l2_band"].append(
+                rel_l2_masked(u_now, data.u_exact, data.band_mask)
+            )
+        else:
+            hist["rel_l2"].append(hist["rel_l2"][-1] if hist["rel_l2"] else float("nan"))
+            hist["rel_l2_band"].append(
+                hist["rel_l2_band"][-1] if hist["rel_l2_band"] else float("nan")
+            )
+
+    u_final = np.asarray(apply({"params": params}, grid))
+    oracle = (
+        "Data term pins to analytic projection v* (not exact u*); "
+        "‖u−v*‖_GT is a smoothness regularizer, not a GT data-leak."
+    )
+    print(f"    [compound-vstar oracle-leak] {oracle}", flush=True)
+    return _pack_metrics(
+        "compound-vstar",
+        u_final,
+        data,
+        hist,
+        extra={
+            "oracle_leak_audit": oracle,
+            "lambda_vstar": float(lambda_vstar),
+            "v_star_rel_l2": rel_l2(data.v_star, data.u_exact),
+            "data_target": "v_star",
+        },
+    )

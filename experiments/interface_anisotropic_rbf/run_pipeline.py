@@ -34,6 +34,7 @@ import numpy as np
 from arms import (
     run_rbf_base,
     train_compound_loss,
+    train_compound_vstar,
     train_correction_field,
     train_rbf_grad,
     train_rbf_shape,
@@ -58,12 +59,30 @@ ARM_ORDER = [
     "correction-field",
     "surrogate-target",
     "compound-loss",
+    "compound-vstar",
 ]
 
 
 def parse_seeds(s: str) -> list[int]:
     """Accept '0,1,2' or '0 1 2'."""
     return [int(x) for x in s.replace(",", " ").split() if x.strip() != ""]
+
+
+def parse_arms(s: str | None) -> list[str]:
+    """Accept 'a,b' or 'a b'; default = full ARM_ORDER. Validate names."""
+    if s is None or str(s).strip() == "":
+        return list(ARM_ORDER)
+    names = [x.strip() for x in str(s).replace(",", " ").split() if x.strip()]
+    unknown = [n for n in names if n not in ARM_ORDER]
+    if unknown:
+        raise ValueError(
+            f"Unknown arm(s) {unknown}; valid: {ARM_ORDER}"
+        )
+    # Preserve ARM_ORDER ordering; drop duplicates
+    selected = [a for a in ARM_ORDER if a in set(names)]
+    if not selected:
+        raise ValueError("(--arms) empty after parsing")
+    return selected
 
 
 def _jsonable(obj):
@@ -108,7 +127,13 @@ def _noise_gate(a_arr: np.ndarray, b_arr: np.ndarray) -> dict:
     }
 
 
-def print_kill_table(agg: dict, kappa_jump: float, cell_stats: dict | None = None) -> str:
+def print_kill_table(
+    agg: dict,
+    kappa_jump: float,
+    cell_stats: dict | None = None,
+    arm_order: list[str] | None = None,
+) -> str:
+    arms = arm_order if arm_order is not None else ARM_ORDER
     header = (
         f"{'arm':<20} {'relL2':<22} {'bandL2':<22} {'s/step':<14} "
         f"{'stability':<18} {'notes':<28}"
@@ -122,7 +147,7 @@ def print_kill_table(agg: dict, kappa_jump: float, cell_stats: dict | None = Non
         header,
         sep,
     ]
-    for arm in ARM_ORDER:
+    for arm in arms:
         a = agg[arm]
         note = "n/a"
         if arm == "rbf-base":
@@ -136,6 +161,8 @@ def print_kill_table(agg: dict, kappa_jump: float, cell_stats: dict | None = Non
                 note += f" anisoκ={np.nanmean(conds):.2e}"
         elif arm == "correction-field":
             note = "GT soft-anchor only"
+        elif arm == "compound-vstar":
+            note = "data→v* (not u*)"
         ms = mean_std(a["rel_l2"])
         mi = median_iqr(a["rel_l2"])
         bs = mean_std(a["band_l2"])
@@ -156,7 +183,8 @@ def print_kill_table(agg: dict, kappa_jump: float, cell_stats: dict | None = Non
         )
     lines.append(sep)
 
-    if cell_stats is not None:
+    have_gate_arms = all(a in agg for a in ("rbf-base", "rbf-grad", "rbf-shape"))
+    if cell_stats is not None and have_gate_arms:
         for gname, _a, _b, _m in GATE_SPECS:
             g = cell_stats["gates"][gname]
             w = g["welch"]
@@ -175,7 +203,7 @@ def print_kill_table(agg: dict, kappa_jump: float, cell_stats: dict | None = Non
                 for arm in ("rbf-base", "rbf-grad", "rbf-shape")
             )
         )
-    else:
+    elif have_gate_arms:
         # Fallback pooled-std gate (legacy) if stats not supplied
         base = np.asarray(agg["rbf-base"]["rel_l2"], dtype=float)
         grad = np.asarray(agg["rbf-grad"]["rel_l2"], dtype=float)
@@ -195,21 +223,28 @@ def print_kill_table(agg: dict, kappa_jump: float, cell_stats: dict | None = Non
             )
 
     # Shape movement summary
-    dlog = agg["rbf-shape"].get("mean_dlog_sigma", [])
-    dangle = agg["rbf-shape"].get("mean_dangle", [])
-    dw = agg["rbf-shape"].get("mean_weight_displacement", [])
-    dmu = agg["rbf-shape"].get("mean_center_displacement", [])
-    lines.append(
-        f"SHAPES ACTUALLY MOVE (mean over seeds): "
-        f"mean|Δw|={np.nanmean(dw) if dw else float('nan'):.4e} "
-        f"mean|Δμ|={np.nanmean(dmu) if dmu else float('nan'):.4e} "
-        f"mean|Δlogσ|={np.nanmean(dlog) if dlog else float('nan'):.4e} "
-        f"mean|Δangle|={np.nanmean(dangle) if dangle else float('nan'):.4e}"
-    )
-    lines.append(
-        "Oracle-leak (correction-field): GT only as soft anchor "
-        "‖(u_base+e_hat)−u*‖_GT; primary L[e_hat]=−(κ-residual)."
-    )
+    if "rbf-shape" in agg:
+        dlog = agg["rbf-shape"].get("mean_dlog_sigma", [])
+        dangle = agg["rbf-shape"].get("mean_dangle", [])
+        dw = agg["rbf-shape"].get("mean_weight_displacement", [])
+        dmu = agg["rbf-shape"].get("mean_center_displacement", [])
+        lines.append(
+            f"SHAPES ACTUALLY MOVE (mean over seeds): "
+            f"mean|Δw|={np.nanmean(dw) if dw else float('nan'):.4e} "
+            f"mean|Δμ|={np.nanmean(dmu) if dmu else float('nan'):.4e} "
+            f"mean|Δlogσ|={np.nanmean(dlog) if dlog else float('nan'):.4e} "
+            f"mean|Δangle|={np.nanmean(dangle) if dangle else float('nan'):.4e}"
+        )
+    if "correction-field" in agg:
+        lines.append(
+            "Oracle-leak (correction-field): GT only as soft anchor "
+            "‖(u_base+e_hat)−u*‖_GT; primary L[e_hat]=−(κ-residual)."
+        )
+    if "compound-vstar" in agg:
+        lines.append(
+            "Oracle-leak (compound-vstar): data term pins to analytic v* "
+            "(not exact u*); smoothness regularizer, not GT leak."
+        )
     lines.append("=" * len(header))
     text = "\n".join(lines)
     print(text)
@@ -239,92 +274,116 @@ def run_seed(seed: int, cfg: dict) -> dict:
         gamma=cfg["gamma"],
     )
 
+    active = cfg.get("arms", ARM_ORDER)
     results = {}
-    results["rbf-base"] = run_rbf_base(data)
-    print(
-        f"  rbf-base: relL2={results['rbf-base']['final_rel_l2']:.4e} "
-        f"band={results['rbf-base']['final_rel_l2_band']:.4e}",
-        flush=True,
-    )
+    if "rbf-base" in active:
+        results["rbf-base"] = run_rbf_base(data)
+        print(
+            f"  rbf-base: relL2={results['rbf-base']['final_rel_l2']:.4e} "
+            f"band={results['rbf-base']['final_rel_l2_band']:.4e}",
+            flush=True,
+        )
 
-    print("  training rbf-grad ...", flush=True)
-    results["rbf-grad"] = train_rbf_grad(
-        data,
-        steps=cfg["steps"],
-        lr=cfg["lr_rbf_grad"],
-        lr_centers=cfg["lr_rbf_grad_centers"],
-        lambda_bc=cfg["lambda_bc"],
-        eval_every=cfg["eval_every"],
-    )
-    print(
-        f"  rbf-grad: relL2={results['rbf-grad']['final_rel_l2']:.4e} "
-        f"band={results['rbf-grad']['final_rel_l2_band']:.4e} "
-        f"s/step={results['rbf-grad']['mean_step_time']:.4f}",
-        flush=True,
-    )
+    if "rbf-grad" in active:
+        print("  training rbf-grad ...", flush=True)
+        results["rbf-grad"] = train_rbf_grad(
+            data,
+            steps=cfg["steps"],
+            lr=cfg["lr_rbf_grad"],
+            lr_centers=cfg["lr_rbf_grad_centers"],
+            lambda_bc=cfg["lambda_bc"],
+            eval_every=cfg["eval_every"],
+        )
+        print(
+            f"  rbf-grad: relL2={results['rbf-grad']['final_rel_l2']:.4e} "
+            f"band={results['rbf-grad']['final_rel_l2_band']:.4e} "
+            f"s/step={results['rbf-grad']['mean_step_time']:.4f}",
+            flush=True,
+        )
 
-    print("  training rbf-shape ...", flush=True)
-    results["rbf-shape"] = train_rbf_shape(
-        data,
-        steps=cfg["steps"],
-        lr=cfg["lr_rbf_shape"],
-        lr_centers=cfg["lr_rbf_shape_centers"],
-        lr_shape=cfg["lr_rbf_shape_shape"],
-        lambda_bc=cfg["lambda_bc"],
-        lambda_flux=cfg["lambda_flux"],
-        eval_every=cfg["eval_every"],
-    )
-    print(
-        f"  rbf-shape: relL2={results['rbf-shape']['final_rel_l2']:.4e} "
-        f"band={results['rbf-shape']['final_rel_l2_band']:.4e} "
-        f"s/step={results['rbf-shape']['mean_step_time']:.4f}",
-        flush=True,
-    )
+    if "rbf-shape" in active:
+        print("  training rbf-shape ...", flush=True)
+        results["rbf-shape"] = train_rbf_shape(
+            data,
+            steps=cfg["steps"],
+            lr=cfg["lr_rbf_shape"],
+            lr_centers=cfg["lr_rbf_shape_centers"],
+            lr_shape=cfg["lr_rbf_shape_shape"],
+            lambda_bc=cfg["lambda_bc"],
+            lambda_flux=cfg["lambda_flux"],
+            eval_every=cfg["eval_every"],
+        )
+        print(
+            f"  rbf-shape: relL2={results['rbf-shape']['final_rel_l2']:.4e} "
+            f"band={results['rbf-shape']['final_rel_l2_band']:.4e} "
+            f"s/step={results['rbf-shape']['mean_step_time']:.4f}",
+            flush=True,
+        )
 
-    print("  training correction-field ...", flush=True)
-    results["correction-field"] = train_correction_field(
-        data,
-        steps=cfg["steps"],
-        lr=cfg["lr_correction"],
-        width=cfg["width"],
-        lambda_anchor=cfg["lambda_anchor"],
-        eval_every=cfg["eval_every"],
-        colloc_batch=cfg["colloc_batch"],
-    )
-    print(
-        f"  correction-field: relL2={results['correction-field']['final_rel_l2']:.4e} "
-        f"band={results['correction-field']['final_rel_l2_band']:.4e}",
-        flush=True,
-    )
+    if "correction-field" in active:
+        print("  training correction-field ...", flush=True)
+        results["correction-field"] = train_correction_field(
+            data,
+            steps=cfg["steps"],
+            lr=cfg["lr_correction"],
+            width=cfg["width"],
+            lambda_anchor=cfg["lambda_anchor"],
+            eval_every=cfg["eval_every"],
+            colloc_batch=cfg["colloc_batch"],
+        )
+        print(
+            f"  correction-field: relL2={results['correction-field']['final_rel_l2']:.4e} "
+            f"band={results['correction-field']['final_rel_l2_band']:.4e}",
+            flush=True,
+        )
 
-    print("  training surrogate-target ...", flush=True)
-    results["surrogate-target"] = train_surrogate_target(
-        data,
-        steps=cfg["steps"],
-        lr=cfg["lr_surrogate"],
-        width=cfg["width"],
-        eval_every=cfg["eval_every"],
-    )
-    print(
-        f"  surrogate-target: relL2={results['surrogate-target']['final_rel_l2']:.4e}",
-        flush=True,
-    )
+    if "surrogate-target" in active:
+        print("  training surrogate-target ...", flush=True)
+        results["surrogate-target"] = train_surrogate_target(
+            data,
+            steps=cfg["steps"],
+            lr=cfg["lr_surrogate"],
+            width=cfg["width"],
+            eval_every=cfg["eval_every"],
+        )
+        print(
+            f"  surrogate-target: relL2={results['surrogate-target']['final_rel_l2']:.4e}",
+            flush=True,
+        )
 
-    print("  training compound-loss ...", flush=True)
-    results["compound-loss"] = train_compound_loss(
-        data,
-        steps=cfg["steps"],
-        lr=cfg["lr_compound"],
-        width=cfg["width"],
-        lambda_data=cfg["lambda_data"],
-        eval_every=cfg["eval_every"],
-        colloc_batch=cfg["colloc_batch"],
-    )
-    print(
-        f"  compound-loss: relL2={results['compound-loss']['final_rel_l2']:.4e} "
-        f"grad-cos={results['compound-loss']['mean_grad_cos']:.3f}",
-        flush=True,
-    )
+    if "compound-loss" in active:
+        print("  training compound-loss ...", flush=True)
+        results["compound-loss"] = train_compound_loss(
+            data,
+            steps=cfg["steps"],
+            lr=cfg["lr_compound"],
+            width=cfg["width"],
+            lambda_data=cfg["lambda_data"],
+            eval_every=cfg["eval_every"],
+            colloc_batch=cfg["colloc_batch"],
+        )
+        print(
+            f"  compound-loss: relL2={results['compound-loss']['final_rel_l2']:.4e} "
+            f"grad-cos={results['compound-loss']['mean_grad_cos']:.3f}",
+            flush=True,
+        )
+
+    if "compound-vstar" in active:
+        print("  training compound-vstar ...", flush=True)
+        results["compound-vstar"] = train_compound_vstar(
+            data,
+            steps=cfg["steps"],
+            lr=cfg["lr_compound"],
+            width=cfg["width"],
+            lambda_vstar=cfg["lambda_vstar"],
+            eval_every=cfg["eval_every"],
+            colloc_batch=cfg["colloc_batch"],
+        )
+        print(
+            f"  compound-vstar: relL2={results['compound-vstar']['final_rel_l2']:.4e} "
+            f"grad-cos={results['compound-vstar']['mean_grad_cos']:.3f}",
+            flush=True,
+        )
 
     elapsed = time.perf_counter() - t0
     # Strip bulky arrays for JSON (keep u_pred for figures via separate cache)
@@ -353,7 +412,8 @@ def run_seed(seed: int, cfg: dict) -> dict:
     return payload, u_preds, results
 
 
-def aggregate(seed_payloads: list[dict]) -> dict:
+def aggregate(seed_payloads: list[dict], arm_order: list[str] | None = None) -> dict:
+    arms = arm_order if arm_order is not None else ARM_ORDER
     agg = {arm: {
         "rel_l2": [],
         "band_l2": [],
@@ -369,10 +429,10 @@ def aggregate(seed_payloads: list[dict]) -> dict:
         "mean_weight_displacement": [],
         "mean_center_displacement": [],
         "diverged": [],
-    } for arm in ARM_ORDER}
+    } for arm in arms}
 
     for pay in seed_payloads:
-        for arm in ARM_ORDER:
+        for arm in arms:
             a = pay["arms"][arm]
             agg[arm]["rel_l2"].append(a["final_rel_l2"])
             agg[arm]["band_l2"].append(a["final_rel_l2_band"])
@@ -396,7 +456,7 @@ def aggregate(seed_payloads: list[dict]) -> dict:
                 )
             agg[arm]["diverged"].append(a.get("diverged", False))
 
-    for arm in ARM_ORDER:
+    for arm in arms:
         modes = agg[arm]["stabilities"]
         # majority vote
         if modes:
@@ -404,14 +464,20 @@ def aggregate(seed_payloads: list[dict]) -> dict:
     return agg
 
 
-def write_kill_csv(agg: dict, path: Path, kappa_jump: float) -> None:
+def write_kill_csv(
+    agg: dict,
+    path: Path,
+    kappa_jump: float,
+    arm_order: list[str] | None = None,
+) -> None:
+    arms = arm_order if arm_order is not None else ARM_ORDER
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
             "arm", "rel_l2_mean", "rel_l2_std", "band_l2_mean", "band_l2_std",
             "step_time_mean", "stability", "kappa_jump",
         ])
-        for arm in ARM_ORDER:
+        for arm in arms:
             a = agg[arm]
             st = np.asarray(a["step_time"], dtype=float)
             st_mean = float(np.nanmean(st)) if np.any(np.isfinite(st)) else float("nan")
@@ -448,6 +514,7 @@ def default_cfg() -> dict:
         "lambda_flux": 1e3,
         "lambda_anchor": 5.0,
         "lambda_data": 500.0,
+        "lambda_vstar": 500.0,
         "width": 64,
         "colloc_batch": 128,
         "lr_rbf_grad": 2e-6,
@@ -458,6 +525,7 @@ def default_cfg() -> dict:
         "lr_correction": 2e-3,
         "lr_surrogate": 5e-3,
         "lr_compound": 2e-3,
+        "arms": list(ARM_ORDER),
     }
 
 
@@ -492,6 +560,21 @@ def main():
         help="collocation grid per side (canonical: 40 or 80)",
     )
     parser.add_argument("--n-centers", type=int, default=None)
+    parser.add_argument(
+        "--lambda-vstar",
+        type=float,
+        default=None,
+        help="data-term weight for compound-vstar (default: 500)",
+    )
+    parser.add_argument(
+        "--arms",
+        type=str,
+        default=None,
+        help=(
+            "comma- or space-separated subset of arms to train/aggregate/print "
+            f"(default: all of {ARM_ORDER})"
+        ),
+    )
     parser.add_argument("--smoke", action="store_true", help="tiny budget for CI/debug")
     parser.add_argument("--skip-figures", action="store_true")
     args = parser.parse_args()
@@ -499,6 +582,9 @@ def main():
     cfg = default_cfg()
     cfg["kappa_jump"] = float(args.kappa_jump)
     cfg["gamma"] = str(args.gamma)
+    cfg["arms"] = parse_arms(args.arms)
+    if args.lambda_vstar is not None:
+        cfg["lambda_vstar"] = float(args.lambda_vstar)
     if args.smoke:
         cfg.update({
             "steps": 30,
@@ -524,13 +610,15 @@ def main():
         cfg["n_rbf_centers"] = args.n_centers
 
     seeds = parse_seeds(args.seeds)
+    active_arms = cfg["arms"]
     RESULTS.mkdir(parents=True, exist_ok=True)
     FIGURES.mkdir(parents=True, exist_ok=True)
 
     print(
         f"device={__import__('jax').devices()}; seeds={seeds}; "
         f"γ={cfg['gamma']}; κ-jump={cfg['kappa_jump']}; steps={cfg['steps']}; "
-        f"centers={cfg['n_rbf_centers']}; res={cfg['resolution']}",
+        f"centers={cfg['n_rbf_centers']}; res={cfg['resolution']}; "
+        f"arms={active_arms}; λ_v*={cfg['lambda_vstar']}",
         flush=True,
     )
 
@@ -554,36 +642,50 @@ def main():
             json.dump(_jsonable(payload), f, indent=2)
         print(f"  wrote {out}", flush=True)
 
-    agg = aggregate(seed_payloads)
-    # Build Welch/bootstrap/kappa-norm stats for this single cell
-    slim_for_stats = []
-    for pay in seed_payloads:
-        slim_for_stats.append({
-            "seed": pay["seed"],
-            "kansa_info": pay.get("kansa_info"),
-            "arms": {
-                arm: {
-                    "final_rel_l2": pay["arms"][arm]["final_rel_l2"],
-                    "final_rel_l2_band": pay["arms"][arm]["final_rel_l2_band"],
-                }
-                for arm in ARM_ORDER
-            },
-        })
-    cell_stats = cell_statistics(slim_for_stats, cond_ref=None, bootstrap_resamples=10000)
-    kill_txt = print_kill_table(agg, cfg["kappa_jump"], cell_stats=cell_stats)
+    agg = aggregate(seed_payloads, arm_order=active_arms)
+    # Build Welch/bootstrap/kappa-norm stats when gate arms are present
+    gate_arms = ("rbf-base", "rbf-grad", "rbf-shape")
+    cell_stats = None
+    if all(a in active_arms for a in gate_arms):
+        slim_for_stats = []
+        for pay in seed_payloads:
+            slim_for_stats.append({
+                "seed": pay["seed"],
+                "kansa_info": pay.get("kansa_info"),
+                "arms": {
+                    arm: {
+                        "final_rel_l2": pay["arms"][arm]["final_rel_l2"],
+                        "final_rel_l2_band": pay["arms"][arm]["final_rel_l2_band"],
+                    }
+                    for arm in active_arms
+                    if arm in pay["arms"]
+                },
+            })
+        # stats.cell_statistics uses its own 6-arm list; only call when those exist
+        from stats import ARM_ORDER as STATS_ARMS
+
+        if all(a in active_arms for a in STATS_ARMS):
+            cell_stats = cell_statistics(
+                slim_for_stats, cond_ref=None, bootstrap_resamples=10000
+            )
+    kill_txt = print_kill_table(
+        agg, cfg["kappa_jump"], cell_stats=cell_stats, arm_order=active_arms
+    )
     jump_tag = f"k{int(cfg['kappa_jump'])}"
     (RESULTS / "kill_table.txt").write_text(kill_txt)
     (RESULTS / f"kill_table_{jump_tag}.txt").write_text(kill_txt)
-    write_kill_csv(agg, RESULTS / "kill_table.csv", cfg["kappa_jump"])
-    write_kill_csv(agg, RESULTS / f"kill_table_{jump_tag}.csv", cfg["kappa_jump"])
+    write_kill_csv(agg, RESULTS / "kill_table.csv", cfg["kappa_jump"], arm_order=active_arms)
+    write_kill_csv(
+        agg, RESULTS / f"kill_table_{jump_tag}.csv", cfg["kappa_jump"], arm_order=active_arms
+    )
 
     consolidated = {
         "cfg": cfg,
         "seeds": seeds,
         "aggregate": _jsonable(agg),
-        "cell_stats": _jsonable(cell_stats),
+        "cell_stats": _jsonable(cell_stats) if cell_stats is not None else None,
         "kill_table": kill_txt,
-        "gates": _jsonable(cell_stats["gates"]),
+        "gates": _jsonable(cell_stats["gates"]) if cell_stats is not None else None,
         "per_seed": _jsonable(seed_payloads),
     }
     with (RESULTS / "results.json").open("w") as f:
