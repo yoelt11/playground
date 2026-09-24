@@ -4,9 +4,15 @@
 Run (smoke):
     .venv/bin/python run_pipeline.py --seeds 0 --steps 50 --kappa-jump 10
 
-Full:
-    .venv/bin/python run_pipeline.py --seeds 0,1,2 --kappa-jump 10
-    .venv/bin/python run_pipeline.py --seeds 0,1,2 --kappa-jump 100
+Full single cell:
+    .venv/bin/python run_pipeline.py --gamma vertical --kappa-jump 10 --resolution 40 \\
+        --seeds '0 1 2 3 4 5'
+    .venv/bin/python run_pipeline.py --gamma circle --kappa-jump 100 --resolution 80 \\
+        --seeds '0 1 2 3 4 5'
+
+Multi-cell sweep:
+    .venv/bin/python run_sweep.py --seeds '0 1 2 3 4 5' --gammas vertical circle \\
+        --kappa 10 100 --res 40 80
 
 Writes results/ (per-seed JSON + results.json + kill_table.*) and figures/.
 """
@@ -33,7 +39,13 @@ from arms import (
     train_rbf_shape,
     train_surrogate_target,
 )
-from common import build_experiment
+from common import build_experiment, default_n_centers
+from stats import (
+    GATE_SPECS,
+    cell_statistics,
+    median_iqr,
+    mean_std,
+)
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
@@ -47,6 +59,11 @@ ARM_ORDER = [
     "surrogate-target",
     "compound-loss",
 ]
+
+
+def parse_seeds(s: str) -> list[int]:
+    """Accept '0,1,2' or '0 1 2'."""
+    return [int(x) for x in s.replace(",", " ").split() if x.strip() != ""]
 
 
 def _jsonable(obj):
@@ -91,7 +108,7 @@ def _noise_gate(a_arr: np.ndarray, b_arr: np.ndarray) -> dict:
     }
 
 
-def print_kill_table(agg: dict, kappa_jump: float) -> str:
+def print_kill_table(agg: dict, kappa_jump: float, cell_stats: dict | None = None) -> str:
     header = (
         f"{'arm':<20} {'relL2':<22} {'bandL2':<22} {'s/step':<14} "
         f"{'stability':<18} {'notes':<28}"
@@ -119,47 +136,63 @@ def print_kill_table(agg: dict, kappa_jump: float) -> str:
                 note += f" anisoκ={np.nanmean(conds):.2e}"
         elif arm == "correction-field":
             note = "GT soft-anchor only"
+        ms = mean_std(a["rel_l2"])
+        mi = median_iqr(a["rel_l2"])
+        bs = mean_std(a["band_l2"])
+        bi = median_iqr(a["band_l2"])
+        rel_str = f"{ms['mean']:.4e}±{ms['std']:.4e}"
+        band_str = f"{bs['mean']:.4e}±{bs['std']:.4e}"
         row = (
-            f"{arm:<20} {_mean_std(a['rel_l2']):<22} "
-            f"{_mean_std(a['band_l2']):<22} "
+            f"{arm:<20} {rel_str:<22} "
+            f"{band_str:<22} "
             f"{_mean_std(a['step_time']):<14} "
             f"{a['stability_mode']:<18} "
             f"{note:<28}"
         )
         lines.append(row)
+        lines.append(
+            f"{'':<20} med±IQR {mi['median']:.4e}±{mi['iqr']:.4e}   "
+            f"band med±IQR {bi['median']:.4e}±{bi['iqr']:.4e}"
+        )
     lines.append(sep)
 
-    base = np.asarray(agg["rbf-base"]["rel_l2"], dtype=float)
-    grad = np.asarray(agg["rbf-grad"]["rel_l2"], dtype=float)
-    shape = np.asarray(agg["rbf-shape"]["rel_l2"], dtype=float)
-    base_b = np.asarray(agg["rbf-base"]["band_l2"], dtype=float)
-    shape_b = np.asarray(agg["rbf-shape"]["band_l2"], dtype=float)
-
-    g_vs_base = _noise_gate(grad, base)
-    s_vs_base = _noise_gate(shape, base)
-    s_vs_grad = _noise_gate(shape, grad)
-    s_band_vs_base = _noise_gate(shape_b, base_b)
-
-    lines.append(
-        f"rbf-grad beats_base_beyond_noise: {g_vs_base['beats_beyond_noise']} "
-        f"(sep={g_vs_base['sep']:+.4e}, pooled_std={g_vs_base['pooled_std']:.4e})"
-    )
-    lines.append(
-        f"rbf-shape beats_base_beyond_noise: {s_vs_base['beats_beyond_noise']} "
-        f"(sep={s_vs_base['sep']:+.4e}, pooled_std={s_vs_base['pooled_std']:.4e})"
-    )
-    lines.append(
-        f"rbf-shape beats_rbf-grad_beyond_noise: {s_vs_grad['beats_beyond_noise']} "
-        f"(sep={s_vs_grad['sep']:+.4e}, pooled_std={s_vs_grad['pooled_std']:.4e})"
-    )
-    lines.append(
-        f"rbf-shape beats_base on INTERFACE-BAND beyond noise: "
-        f"{s_band_vs_base['beats_beyond_noise']} "
-        f"(sep={s_band_vs_base['sep']:+.4e}, "
-        f"pooled_std={s_band_vs_base['pooled_std']:.4e}; "
-        f"band shape={np.nanmean(shape_b):.4e}±{np.nanstd(shape_b):.4e} "
-        f"vs base={np.nanmean(base_b):.4e}±{np.nanstd(base_b):.4e})"
-    )
+    if cell_stats is not None:
+        for gname, _a, _b, _m in GATE_SPECS:
+            g = cell_stats["gates"][gname]
+            w = g["welch"]
+            boot = g["bootstrap_mean_diff_95ci"]
+            lines.append(
+                f"{gname}: Welch t={w['t']:.4g} df={w['df']:.3g} "
+                f"p={w['pvalue']:.4g} beats_beyond_noise={w['beats_beyond_noise']}; "
+                f"bootΔ={boot['mean_diff']:+.4e} "
+                f"95%CI=[{boot['ci_low']:+.4e},{boot['ci_high']:+.4e}]"
+            )
+        kn = cell_stats.get("kappa_normalized", {})
+        lines.append(
+            f"kappa-normalized (cond_ref={kn.get('cond_ref', float('nan')):.3e}): "
+            + ", ".join(
+                f"{arm}={kn.get(arm, {}).get('effective_error_mean', float('nan')):.4e}"
+                for arm in ("rbf-base", "rbf-grad", "rbf-shape")
+            )
+        )
+    else:
+        # Fallback pooled-std gate (legacy) if stats not supplied
+        base = np.asarray(agg["rbf-base"]["rel_l2"], dtype=float)
+        grad = np.asarray(agg["rbf-grad"]["rel_l2"], dtype=float)
+        shape = np.asarray(agg["rbf-shape"]["rel_l2"], dtype=float)
+        base_b = np.asarray(agg["rbf-base"]["band_l2"], dtype=float)
+        shape_b = np.asarray(agg["rbf-shape"]["band_l2"], dtype=float)
+        for label, a, b in (
+            ("rbf-grad beats_base", grad, base),
+            ("rbf-shape beats_base", shape, base),
+            ("rbf-shape beats_rbf-grad", shape, grad),
+            ("rbf-shape band beats_base", shape_b, base_b),
+        ):
+            g = _noise_gate(a, b)
+            lines.append(
+                f"{label}_beyond_noise: {g['beats_beyond_noise']} "
+                f"(sep={g['sep']:+.4e}, pooled_std={g['pooled_std']:.4e})"
+            )
 
     # Shape movement summary
     dlog = agg["rbf-shape"].get("mean_dlog_sigma", [])
@@ -184,7 +217,11 @@ def print_kill_table(agg: dict, kappa_jump: float) -> str:
 
 
 def run_seed(seed: int, cfg: dict) -> dict:
-    print(f"\n=== seed {seed} (κ-jump={cfg['kappa_jump']:g}) ===", flush=True)
+    print(
+        f"\n=== seed {seed} (γ={cfg['gamma']}, κ-jump={cfg['kappa_jump']:g}, "
+        f"res={cfg['resolution']}) ===",
+        flush=True,
+    )
     t0 = time.perf_counter()
     data = build_experiment(
         seed=seed,
@@ -199,6 +236,7 @@ def run_seed(seed: int, cfg: dict) -> dict:
         band=cfg["band"],
         alpha=cfg["alpha"],
         beta=cfg["beta"],
+        gamma=cfg["gamma"],
     )
 
     results = {}
@@ -300,9 +338,13 @@ def run_seed(seed: int, cfg: dict) -> dict:
 
     payload = {
         "seed": seed,
+        "gamma": cfg["gamma"],
         "kappa_jump": cfg["kappa_jump"],
+        "resolution": cfg["resolution"],
+        "n_rbf_centers": cfg["n_rbf_centers"],
         "elapsed_s": elapsed,
         "interface_verify": data.interface_verify,
+        "pde_verify": data.pde_verify,
         "kansa_info": data.kansa_info,
         "surrogate_info": data.surrogate_info,
         "arms": _jsonable(slim),
@@ -386,10 +428,12 @@ def write_kill_csv(agg: dict, path: Path, kappa_jump: float) -> None:
 
 
 def default_cfg() -> dict:
+    resolution = 40
     return {
-        "resolution": 36,
+        "gamma": "vertical",
+        "resolution": resolution,
         "gt_fraction": 0.12,
-        "n_rbf_centers": 48,
+        "n_rbf_centers": default_n_centers(resolution),
         "epsilon": 1.5,
         "kappa_m": 1.0,
         "kappa_jump": 10.0,
@@ -419,15 +463,34 @@ def default_cfg() -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="interface_anisotropic_rbf pipeline")
-    parser.add_argument("--seeds", type=str, default="0,1,2")
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default="0,1,2,3,4,5",
+        help="comma- or space-separated seeds (default: 0..5)",
+    )
     parser.add_argument(
         "--kappa-jump",
         type=float,
         default=10.0,
         help="κ⁺/κ⁻ jump ratio (use 10 or 100)",
     )
+    parser.add_argument(
+        "--gamma",
+        type=str,
+        default="vertical",
+        choices=["vertical", "circle"],
+        help="interface geometry",
+    )
     parser.add_argument("--steps", type=int, default=None)
-    parser.add_argument("--resolution", type=int, default=None)
+    parser.add_argument(
+        "--resolution",
+        "--res",
+        dest="resolution",
+        type=int,
+        default=None,
+        help="collocation grid per side (canonical: 40 or 80)",
+    )
     parser.add_argument("--n-centers", type=int, default=None)
     parser.add_argument("--smoke", action="store_true", help="tiny budget for CI/debug")
     parser.add_argument("--skip-figures", action="store_true")
@@ -435,6 +498,7 @@ def main():
 
     cfg = default_cfg()
     cfg["kappa_jump"] = float(args.kappa_jump)
+    cfg["gamma"] = str(args.gamma)
     if args.smoke:
         cfg.update({
             "steps": 30,
@@ -450,16 +514,22 @@ def main():
         cfg["steps"] = args.steps
     if args.resolution is not None:
         cfg["resolution"] = args.resolution
+        # Scale interface/boundary sampling with grid unless smoke overrode centers
+        if not args.smoke:
+            cfg["n_gamma"] = max(32, args.resolution)
+            cfg["n_boundary"] = max(32, args.resolution)
+        if args.n_centers is None and not args.smoke:
+            cfg["n_rbf_centers"] = default_n_centers(args.resolution)
     if args.n_centers is not None:
         cfg["n_rbf_centers"] = args.n_centers
 
-    seeds = [int(s) for s in args.seeds.split(",") if s.strip() != ""]
+    seeds = parse_seeds(args.seeds)
     RESULTS.mkdir(parents=True, exist_ok=True)
     FIGURES.mkdir(parents=True, exist_ok=True)
 
     print(
         f"device={__import__('jax').devices()}; seeds={seeds}; "
-        f"κ-jump={cfg['kappa_jump']}; steps={cfg['steps']}; "
+        f"γ={cfg['gamma']}; κ-jump={cfg['kappa_jump']}; steps={cfg['steps']}; "
         f"centers={cfg['n_rbf_centers']}; res={cfg['resolution']}",
         flush=True,
     )
@@ -472,13 +542,35 @@ def main():
         seed_payloads.append(payload)
         last_preds = u_preds
         last_results = results
-        out = RESULTS / f"seed_{seed}_k{int(cfg['kappa_jump'])}.json"
+        out = (
+            RESULTS
+            / f"seed_{seed}_g{cfg['gamma']}_k{int(cfg['kappa_jump'])}_r{cfg['resolution']}.json"
+        )
+        # Also keep legacy name for vertical default path
+        legacy = RESULTS / f"seed_{seed}_k{int(cfg['kappa_jump'])}.json"
         with out.open("w") as f:
+            json.dump(_jsonable(payload), f, indent=2)
+        with legacy.open("w") as f:
             json.dump(_jsonable(payload), f, indent=2)
         print(f"  wrote {out}", flush=True)
 
     agg = aggregate(seed_payloads)
-    kill_txt = print_kill_table(agg, cfg["kappa_jump"])
+    # Build Welch/bootstrap/kappa-norm stats for this single cell
+    slim_for_stats = []
+    for pay in seed_payloads:
+        slim_for_stats.append({
+            "seed": pay["seed"],
+            "kansa_info": pay.get("kansa_info"),
+            "arms": {
+                arm: {
+                    "final_rel_l2": pay["arms"][arm]["final_rel_l2"],
+                    "final_rel_l2_band": pay["arms"][arm]["final_rel_l2_band"],
+                }
+                for arm in ARM_ORDER
+            },
+        })
+    cell_stats = cell_statistics(slim_for_stats, cond_ref=None, bootstrap_resamples=10000)
+    kill_txt = print_kill_table(agg, cfg["kappa_jump"], cell_stats=cell_stats)
     jump_tag = f"k{int(cfg['kappa_jump'])}"
     (RESULTS / "kill_table.txt").write_text(kill_txt)
     (RESULTS / f"kill_table_{jump_tag}.txt").write_text(kill_txt)
@@ -489,25 +581,9 @@ def main():
         "cfg": cfg,
         "seeds": seeds,
         "aggregate": _jsonable(agg),
+        "cell_stats": _jsonable(cell_stats),
         "kill_table": kill_txt,
-        "gates": {
-            "rbf_grad_vs_base": _noise_gate(
-                np.asarray(agg["rbf-grad"]["rel_l2"]),
-                np.asarray(agg["rbf-base"]["rel_l2"]),
-            ),
-            "rbf_shape_vs_base": _noise_gate(
-                np.asarray(agg["rbf-shape"]["rel_l2"]),
-                np.asarray(agg["rbf-base"]["rel_l2"]),
-            ),
-            "rbf_shape_vs_grad": _noise_gate(
-                np.asarray(agg["rbf-shape"]["rel_l2"]),
-                np.asarray(agg["rbf-grad"]["rel_l2"]),
-            ),
-            "rbf_shape_band_vs_base": _noise_gate(
-                np.asarray(agg["rbf-shape"]["band_l2"]),
-                np.asarray(agg["rbf-base"]["band_l2"]),
-            ),
-        },
+        "gates": _jsonable(cell_stats["gates"]),
         "per_seed": _jsonable(seed_payloads),
     }
     with (RESULTS / "results.json").open("w") as f:

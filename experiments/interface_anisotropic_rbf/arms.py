@@ -17,6 +17,7 @@ from common import (
     ExperimentData,
     anisotropic_field_from_params,
     build_aniso_init,
+    gamma_normals,
     rel_l2,
     rel_l2_masked,
     verify_aniso_init_matches_base,
@@ -344,6 +345,10 @@ def train_rbf_shape(
     x_bnd = jnp.asarray(data.boundary_pts)
     u_bnd = jnp.asarray(data.u_bnd)
     gamma = jnp.asarray(data.gamma_pts)
+    # Geometry normals: vertical → (1,0); circle → radial outward from Ω⁻
+    nrms = jnp.asarray(
+        gamma_normals(np.asarray(data.gamma_pts), gamma=data.gamma)
+    )
     kappa_m, kappa_p = float(data.kappa_m), float(data.kappa_p)
     grid = jnp.asarray(data.grid)
     # Subsample interior for anisotropic lap (expensive nested AD) — full every eval
@@ -376,14 +381,21 @@ def train_rbf_shape(
         phys = jnp.mean((-k_col * lap - f_col) ** 2)
         u_b = field(p, x_bnd)
         bc = jnp.mean((u_b - u_bnd) ** 2)
-        # Flux soft: (κ⁺−κ⁻) ∂x u ≈ 0 on Γ via finite-diff
-        eps_x = 1e-4
-        gp = gamma
-        um = field(p, gp + jnp.array([-eps_x, 0.0]))
-        up = field(p, gp + jnp.array([+eps_x, 0.0]))
-        # For C¹ field, flux jump ∝ ∂x u; FD of u across Γ proxies ∂x
-        dux = (up - um) / (2 * eps_x)
-        flux = jnp.mean(((kappa_p - kappa_m) * dux) ** 2)
+        # Flux soft: [κ ∂_ν u] = κ⁺(∇u·n)|_{+} − κ⁻(∇u·n)|_{-} on Γ.
+        # n = gamma_normals (vertical: x-hat; circle: radial). One-sided ±ε n
+        # matches Kansa; for C¹ fields this ≈ (κ⁺−κ⁻)(∇u·n) (vertical ≡ old ∂x).
+        eps_n = 1e-4
+
+        def u_scalar(x):
+            return field(p, x[None, :])[0]
+
+        def saltus_at(gp, n):
+            g_p = jax.grad(u_scalar)(gp + eps_n * n)
+            g_m = jax.grad(u_scalar)(gp - eps_n * n)
+            return kappa_p * jnp.dot(g_p, n) - kappa_m * jnp.dot(g_m, n)
+
+        saltus = jax.vmap(saltus_at)(gamma, nrms)
+        flux = jnp.mean(saltus**2)
         return phys + lambda_bc * bc + lambda_flux * flux, (phys, bc, flux)
 
     # Don't JIT the full step — nested AD + optax is heavy; use jax.grad
