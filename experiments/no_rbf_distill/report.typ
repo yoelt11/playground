@@ -1,9 +1,18 @@
 // no_rbf_distill — Distillation of an approximate Neural-Operator solution
 // via residual-allocated RBF kernels (Phase 1 = deterministic; Phase 2 =
 // stochastic-NO uncertainty allocation; Phase 2b = complementary-σ controls).
+#import "@preview/bloated-neurips:0.8.0": *
+
+#let authors = (
+  (name: "Edgar Torres", affl: "main"),
+  (name: "Second Participant", affl: "main"),
+  (name: "AstroBot AX-7", affl: "main"),
+)
+#let affls = (main: (institution: "Independent Research"))
+
 #show: neurips2026.with(
   title: [Distilling a Neural Operator through Residual-Allocated RBF Kernels: Does Predictive Uncertainty Add Signal?],
-  authors: (Authors: Edgar Torres, second participant, AstroBot AX-7)$,
+  authors: (authors, affls),
   keywords: ("RBF", "domain decomposition", "error refinement", "neural operator", "uncertainty"),
   abstract: [
     We ask whether an approximate Neural-Operator solution can be distilled into a cheap
@@ -15,7 +24,7 @@
     blend (Phase 2: NO-GO, $times 0.556$) nor cleaner sigma-only / residual-split controls
     (Phase 2b: CLOSED) beat the residual alone. Spatial diagnostics show the ensemble
     uncertainty ($sigma$) and the residual carry *partially complementary* error
-    information ($symbolic$), yet none of the tested uncertainty-driven allocations exploit
+    information (symbolic), yet none of the tested uncertainty-driven allocations exploit
     it on this problem.
   ],
 )
@@ -23,9 +32,9 @@
 == Introduction
 
 A Neural Operator (NO) trained on a parametric PDE family yields an *approximate*
-solution $u_NO$ at inference. We test whether we can improve it cheaply by fitting an RBF
-correction $v_RBF$ through an error-PDE corrector, $cal(L)[v_RBF] = -R(u_NO)$, where the
-collocation kernels are allocated from the solution's PDE residual $R(u_NO)$ rather than
+solution $u_("NO")$ at inference. We test whether we can improve it cheaply by fitting an RBF
+correction $v_("RBF")$ through an error-PDE corrector, $cal(L)[v_("RBF")] = -R(u_("NO"))$, where the
+collocation kernels are allocated from the solution's PDE residual $R(u_("NO"))$ rather than
 uniformly. We further test whether, for a *stochastic* NO (deep ensemble), the predictive
 uncertainty $sigma$ adds allocation signal over $R$.
 
@@ -34,18 +43,18 @@ uncertainty $sigma$ adds allocation signal over $R$.
 2D elliptic interface-$Gamma$ Poisson problem, vertical interface $x = 0.5$,
 $kappa_- = 1$, $kappa_+ = 10$, manufactured solution, $40 times 40$ grid, fixed budget
 $K = 64$ isotropic Gaussian RBF centers, $epsilon = 3.5$, ridged Kansa corrector.
-Corrected field $u_NO + v_RBF$; metric = relative-L2 $norm(u_NO + v_RBF - u^*) slash norm(u^*)$.
+Corrected field $u_("NO") + v_("RBF")$; metric = relative-L2 $norm(u_("NO") + v_("RBF") - u^*) slash norm(u^*)$.
 Three seeds (0,1,2); deterministic per seed; numpy float64.
 
 == Phase 1 — residual-allocated kernels (deterministic)
 
-Arms at identical $K$: `uniform`, `residual_alloc` (density $propto |R|$), `shuffled_alloc`
+Arms at identical $K$: `uniform`, `residual_alloc` (density $prop |R|$), `shuffled_alloc`
 (same weight histogram, spatially scrambled control).
 
 #figure(
-  cx.nonbreakingtable(
+  table(
     columns: (auto, auto, auto, auto),
-    table.header(arm, mean text(weight: "bold"), std, values),
+    table.header([arm], [mean], [std], [values]),
     ["uniform", "2.022e-01", "6.3e-03", "1.961/2.018/2.086"],
     ["residual_alloc", "1.017e-01", "2.0e-02", "0.930/0.874/1.248"],
     ["shuffled_alloc", "2.034e-01", "4.3e-03", "1.989/2.038/2.076"],
@@ -55,22 +64,22 @@ Arms at identical $K$: `uniform`, `residual_alloc` (density $propto |R|$), `shuf
     $times 1.99$ (gate >= 1.5); shuffled ~ uniform.],
 )
 
-Verdict: **GO**. Residual-allocated placement beats uniform by $times 1.99$; the
+Verdict: *GO*. Residual-allocated placement beats uniform by $times 1.99$; the
 shuffled control matches uniform, so it is the *spatial emphasis*, not placement freedom,
-that helps. Notably uniform/shuffled correction is slightly *worse* than the bare $u_NO$
+that helps. Notably uniform/shuffled correction is slightly *worse* than the bare $u_("NO")$
 (2.02e-01 > 1.57e-01): a naive equal-cost corrector hurts, and only residual-localized
 kernels recover.
 
 == Phase 2 — stochastic NO and uncertainty allocation
 
-An $M = 3$ deep ensemble yields a predictive mean $u_NO$ and epistemic std $sigma$. Arms:
-`residual_only` ($propto |R|$), `residual_unc` (blend $+|R| + lambda sigma$, $lambda = 1$,
+An $M = 3$ deep ensemble yields a predictive mean $u_("NO")$ and epistemic std $sigma$. Arms:
+`residual_only` ($prop |R|$), `residual_unc` (blend $+|R| + lambda sigma$, $lambda = 1$,
 unit-mean normalized), `shuffled_unc` (sigma permuted spatially, control).
 
 #figure(
-  cx.nonbreakingtable(
+  table(
     columns: (auto, auto, auto),
-    table.header(arm, mean, std),
+    table.header([arm], [mean], [std]),
     ["residual_only", "1.032e-01", "2.18e-02"],
     ["residual_unc", "1.856e-01", "1.05e-02"],
     ["shuffled_unc", "1.447e-01", "1.13e-02"],
@@ -79,7 +88,7 @@ unit-mean normalized), `shuffled_unc` (sigma permuted spatially, control).
   caption: [Phase 2 corrected rel-L2. residual_unc vs residual_only: $times 0.556$ (FAIL).],
 )
 
-Verdict: **NO-GO**. Blending $sigma$ into one global weight field dilutes residual-guided
+Verdict: *NO-GO*. Blending $sigma$ into one global weight field dilutes residual-guided
 placement in all three seeds. The shuffled control passes but cannot save the claim.
 
 == Spatial correlation of uncertainty, residual, and error
@@ -89,9 +98,9 @@ and the true corrected error $|u + v - u^*|$ relate *in space* (interior nodes, 
 seeds).
 
 #figure(
-  cx.nonbreakingtable(
+  table(
     columns: (auto, auto, auto),
-    table.header(pair, Pearson, Spearman),
+    table.header([pair], [Pearson], [Spearman]),
     [$sigma$ and $|R|$, "+0.207", "+0.221"],
     [$sigma$ and err, "+0.442", "+0.450"],
     [$|R|$ and err, "+0.598", "+0.657"],
@@ -100,7 +109,7 @@ seeds).
     the correction is wrong; $sigma$ is genuinely informative but weakly related to $|R|$.],
 )
 
-Top-10% overlap (mean): $sigma cap$ err = 0.29, $|R| cap$ err = 0.49, $sigma cap |R|$ = 0.28.
+Top-10% overlap (mean): $sigma ∩$ err = 0.29, $|R| ∩$ err = 0.49, $sigma ∩ |R|$ = 0.28.
 The ensemble and the residual flag *partially different* high-error regions — yet the
 fixed-priority blend dilutes placement rather than sharpening it.
 
@@ -111,13 +120,13 @@ allocation, and a *split* allocation where $alpha K$ kernels are sigma-placed an
 $(1 - alpha) K$ are residual-placed (no global blend), $alpha = 0.25$ ($K = 64$).
 
 #figure(
-  cx.nonbreakingtable(
+  table(
     columns: (auto, auto, auto),
-    table.header(arm, mean, values),
+    table.header([arm], [mean], [values]),
     ["residual_only", "1.03e-01", "0.957/0.862/1.28"],
     ["sigma_only", "1.92e-01", "2.16/1.81/1.80"],
     ["residual_split_sigma", "1.72e-01", "1.67/1.77/1.73"],
-  ],
+  ),
   caption: [Phase 2b corrected rel-L2 (values per seed x1e-1). sigma-only $times 0.54$,
     split $times 0.60$ vs residual_only (gate >= 1.2).],
 )
@@ -126,14 +135,14 @@ Center-overlap with top-10% true error (mean): residual-placed 0.375, sigma-plac
 (split-sigma subset 0.167). Sigma-dedicated kernels hit true high-error sites *less* often
 than residual-placed ones.
 
-Verdict: **UNCONFIRMED / CLOSED** for the uncertainty branch on this toy. $sigma$ is not a
+Verdict: *UNCONFIRMED / CLOSED* for the uncertainty branch on this toy. $sigma$ is not a
 usable sole allocator, and giving it a dedicated subset alongside the residual does not help.
 
 == Discussion and disclaimer
 
 On this 2D elliptic-interface benchmark the raw PDE residual is the dominant allocation
-signal; the ensemble uncertainty, while spatially informative ($sigma leftrightarrow$ err
-~ 0.44) and only weakly collinear with the residual ($sim 0.21$), does not translate into
+signal; the ensemble uncertainty, while spatially informative ($sigma ↔$ err
+~ 0.44) and only weakly collinear with the residual ($approx 0.21$), does not translate into
 better placement through any of the three mechanisms tested (global blend, $sigma$-only,
 dedicated subset).
 
