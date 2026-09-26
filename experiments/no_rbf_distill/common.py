@@ -438,6 +438,10 @@ ARM_NAMES = ("uniform", "residual_alloc", "shuffled_alloc")
 DEFAULT_LAMBDA_UNC = 1.0
 STOCH_ARM_NAMES = ("residual_only", "residual_unc", "shuffled_unc")
 
+# Phase 2b: complementary-σ controls (σ-only + split subsets; not a global blend)
+DEFAULT_SPLIT_ALPHA = 0.25
+STOCH_ARM_NAMES2 = ("residual_only", "sigma_only", "residual_split_sigma")
+
 
 def _normalize_unit_mean(v: np.ndarray) -> np.ndarray:
     """Scale nonnegative field so mean==1 (or all-ones if near-zero)."""
@@ -564,3 +568,116 @@ def sigma_residual_overlap_diagnostics(
         "abs_r_mean": float(abs_r.mean()),
         "abs_r_max": float(abs_r.max()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b allocation: σ-only + residual/σ split subsets (NOT a global blend)
+# ---------------------------------------------------------------------------
+
+def allocate_sigma(
+    k: int,
+    grid: np.ndarray,
+    sigma_flat: np.ndarray,
+    interior_idx: np.ndarray,
+    seed: int,
+    uniform_floor: float = UNIFORM_FLOOR,
+) -> np.ndarray:
+    """Importance-sample K centers with density ∝ σ² + floor (no residual term).
+
+    Mirrors ``allocate_residual`` (same weight power / floor / RNG style) but
+    uses the ensemble disagreement field as the weight.
+    """
+    rng = np.random.default_rng(seed + 702)
+    idx = np.asarray(interior_idx, dtype=int)
+    pts = np.asarray(grid, dtype=np.float64)[idx]
+    sig = np.asarray(sigma_flat, dtype=np.float64).ravel()[idx]
+    w = _importance_weights(sig, uniform_floor=uniform_floor, power=2.0)
+    if len(pts) >= k:
+        chosen = rng.choice(len(pts), size=k, replace=False, p=w)
+        centers = pts[chosen].copy()
+    else:
+        n_side = int(np.sqrt(len(grid)))
+        h = 1.0 / max(n_side - 1, 1)
+        centers = _greedy_weighted_centers(pts, w, k, rng, min_sep=0.5 * h)
+    return _clip_interior(centers)
+
+
+def allocate_residual_split_sigma(
+    k: int,
+    grid: np.ndarray,
+    residual_flat: np.ndarray,
+    sigma_flat: np.ndarray,
+    interior_idx: np.ndarray,
+    seed: int,
+    alpha: float = DEFAULT_SPLIT_ALPHA,
+    uniform_floor: float = UNIFORM_FLOOR,
+) -> tuple[np.ndarray, dict]:
+    """Split budget: (1−α)·K residual-placed + α·K σ-placed, concatenated.
+
+    Two independently importance-sampled subsets (NOT a blended weight field).
+    Centers are ordered ``[residual_subset; sigma_subset]``. Returns
+    ``(centers, meta)`` with subset sizes and the split index.
+
+    RNG offsets: residual subset ``seed+802``, σ subset ``seed+903`` (distinct
+    from residual_only ``+202`` / sigma_only ``+702``).
+    """
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    k_sigma = int(round(alpha * k))
+    k_sigma = max(0, min(int(k), k_sigma))
+    k_residual = int(k) - k_sigma
+
+    idx = np.asarray(interior_idx, dtype=int)
+    pts = np.asarray(grid, dtype=np.float64)[idx]
+    abs_r = np.abs(np.asarray(residual_flat, dtype=np.float64).ravel()[idx])
+    sig = np.asarray(sigma_flat, dtype=np.float64).ravel()[idx]
+    w_r = _importance_weights(abs_r, uniform_floor=uniform_floor, power=2.0)
+    w_s = _importance_weights(sig, uniform_floor=uniform_floor, power=2.0)
+
+    n_side = int(np.sqrt(len(grid)))
+    h = 1.0 / max(n_side - 1, 1)
+    min_sep = 0.5 * h
+
+    def _draw(n_draw: int, weights: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        if n_draw <= 0:
+            return np.zeros((0, 2), dtype=np.float64)
+        if len(pts) >= n_draw:
+            chosen = rng.choice(len(pts), size=n_draw, replace=False, p=weights)
+            return pts[chosen].copy()
+        return _greedy_weighted_centers(pts, weights, n_draw, rng, min_sep=min_sep)
+
+    rng_r = np.random.default_rng(seed + 802)
+    rng_s = np.random.default_rng(seed + 903)
+    centers_r = _draw(k_residual, w_r, rng_r)
+    centers_s = _draw(k_sigma, w_s, rng_s)
+    centers = np.concatenate([centers_r, centers_s], axis=0)
+    meta = {
+        "alpha": alpha,
+        "n_residual": int(k_residual),
+        "n_sigma": int(k_sigma),
+        "split_index": int(k_residual),
+    }
+    return _clip_interior(centers), meta
+
+
+def frac_centers_in_top_error(
+    centers: np.ndarray,
+    grid: np.ndarray,
+    err_flat: np.ndarray,
+    top_frac: float = 0.1,
+) -> float:
+    """Fraction of centers whose nearest grid node is in the top-frac |err| sites."""
+    centers = np.asarray(centers, dtype=np.float64)
+    if len(centers) == 0:
+        return float("nan")
+    grid = np.asarray(grid, dtype=np.float64)
+    err = np.abs(np.asarray(err_flat, dtype=np.float64).ravel())
+    n = len(grid)
+    if n == 0 or len(err) != n:
+        return float("nan")
+    k_top = max(1, int(np.ceil(float(top_frac) * n)))
+    # Nearest grid index per center (euclidean)
+    d2 = ((centers[:, None, :] - grid[None, :, :]) ** 2).sum(axis=-1)
+    nearest = np.argmin(d2, axis=1)
+    top_set = set(np.argpartition(err, -k_top)[-k_top:].tolist())
+    hits = sum(1 for i in nearest if int(i) in top_set)
+    return float(hits) / float(len(centers))

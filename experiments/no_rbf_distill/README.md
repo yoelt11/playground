@@ -53,17 +53,34 @@ emphasis helps."
   If residual_unc ties residual_only, or shuffled matches residual_unc → **NO-GO**
   (residual already carries the signal). High corr(σ,|R|) is a valid scientific NO-GO.
 
+## Phase 2b — complementary-σ controls (σ-only + split subsets)
+
+Global blend of |R| and σ NO-GO'd in Phase 2. Hypothesis: σ helps only if used
+**directly** (σ-only) or to place a **separate subset** of kernels alongside
+residual-placed ones — not blended into one global weight field.
+
+- **Arms at fixed K** (default α=0.25 for the split):
+  1. `residual_only` — reference (same policy as Phase 2).
+  2. `sigma_only` — density ∝ σ alone.
+  3. `residual_split_sigma` — (1−α)·K residual-placed + α·K σ-placed, concatenated
+     (independent importance samples; NOT a blend).
+- **Go/no-go:** σ-only ≥1.2× vs residual_only (unexpected win); split ≥1.2× and
+  multi-seed stable (the claim that can rescue uncertainty). If both fail →
+  **UNCONFIRMED/CLOSED** for the uncertainty branch.
+
 ## Directory Structure
 
 ```
 ├── README.md                 # this file
-├── common.py                 # shared problem + RBF allocation (Phase 1+2)
+├── common.py                 # shared problem + RBF allocation (Phase 1+2+2b)
 ├── no_model.py               # TinyNO + TinyNOEnsemble (numpy float64)
 ├── run_train_no.py           # train Phase-1 single-model NO
 ├── run_pipeline.py           # Phase 1 end-to-end
 ├── evaluate.py               # Phase 1 arm table / go-no-go
 ├── run_pipeline_stoch.py     # Phase 2 ensemble + residual±σ allocation
 ├── evaluate_stoch.py         # Phase 2 arm table / go-no-go
+├── run_pipeline_2b.py        # Phase 2b σ-only + residual/σ split
+├── evaluate_2b.py            # Phase 2b arm table / go-no-go
 ├── results/                  # per-arm metrics + tables
 └── figures/                  # diagnostic maps
 ```
@@ -79,6 +96,10 @@ python evaluate.py
 # Phase 2 (same GO cell: K=64, resolution=40, vertical, kappa_jump=10)
 python run_pipeline_stoch.py --seeds 0,1,2 --K 64 --resolution 40 --skip-figures
 python evaluate_stoch.py --seeds 0,1,2
+
+# Phase 2b (complementary-σ; figures default off)
+python run_pipeline_2b.py --seeds 0,1,2 --K 64 --resolution 40 --skip-figures
+python evaluate_2b.py --seeds 0,1,2
 ```
 
 Sibling venv: `../interface_anisotropic_rbf/.venv/bin/python`.
@@ -86,4 +107,5 @@ Sibling venv: `../interface_anisotropic_rbf/.venv/bin/python`.
 ## Status
 
 Phase 1 (deterministic residual-allocated distillation): **GO** (passed).
-Phase 2 (stochastic NO + uncertainty): implemented; see `results/phase2_verdict.json`.
+Phase 2 (stochastic NO + uncertainty blend): **NO-GO** (see `results/phase2_verdict.json`).
+Phase 2b (complementary-σ): see `results/phase2b_verdict.json`.
