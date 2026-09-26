@@ -24,62 +24,66 @@ emphasis helps."
 3. (Phase 2) Does predictive uncertainty of a **stochastic** NO add allocation signal
    over the raw residual, or is the residual already the stronger signal?
 
-## Method (deterministic phase first — per oracle)
+## Method (Phase 1 — deterministic; PASSED)
 
 - **Toy PDE:** 2D elliptic interface-Γ Poisson, `−∇·(κ(x)∇u) = f` on Ω∖Γ, piecewise-κ,
-  manufactured solution with a derivative kink at Γ (forces spatial heterogeneity so
-  allocation matters). Reuse the shared benchmark from
-  `../interface_anisotropic_rbf/common.py` (`u_exact`, `f_exact`, `kappa_of_points`,
-  `make_grid`, `interface_band_mask`, `rel_l2`, Kansa helpers).
-- **NO surrogate:** a small, cheap-trained Neural Operator (JAX FNO or DeepONet,
-  laptop-scale) producing an approximate `u_NO` for a given κ instance.
-- **Residual:** PDE residual `R(u_NO) = −∇·(κ∇u_NO) − f` (+ interface/BC mismatch).
-- **Arms at FIXED kernel budget** (identical kernel count, identical solver steps;
-  only placement varies):
-  - `uniform`        — kernels on a uniform grid.
-  - `residual-alloc` — kernel density ∝ |R(u_NO)| (e.g. weighted centroidal /
-    importance-sampled placement from the residual field).
-  - `shuffled-alloc` — same kernel count, placement shuffled / permuted (control).
-- **Solve:** fit `v_RBF` weights by collocating `L[v_RBF] = −R(u_NO)` (Kansa / RBF-FD),
-  i.e. the error-PDE corrector form.
-- **Metric (single discriminative):** relative-L2 error of `u_NO + v_RBF` vs `u_exact`,
-  at fixed total cost (kernel count + solver FLOPs tied across arms).
-- **Go/no-go:** `residual_alloc` beats `uniform` by a pre-set margin (≥1.5× rel-L2
-  reduction) AND `shuffled_alloc ≈ uniform` (shuffled does not match residual-alloc).
-- **Implementation:** JAX, deterministic per seed, multi-seed (≥3). CPU fallback fine.
+  manufactured solution with a derivative kink at Γ. Reuse
+  `../interface_anisotropic_rbf/common.py`.
+- **NO surrogate:** tiny spectral `TinyNO` (numpy float64; no JAX) — capacity too small
+  to resolve the κ-interface kink, so residual concentrates near Γ.
+- **Arms at FIXED kernel budget K:** `uniform` / `residual_alloc` / `shuffled_alloc`.
+- **Solve:** fit `v_RBF` by collocating `L[v] = −R(u_NO)` (error-PDE corrector).
+- **Go/no-go (passed):** residual_alloc 1.017e-01 vs uniform 2.022e-01 (×1.99);
+  shuffled ≈ uniform.
 
-## Phase 2 (run only if phase 1 passes)
+## Phase 2 — stochastic NO + uncertainty allocation
 
-- **Stochastic NO:** 3-member tiny deep ensemble (MC-dropout acceptable only as a cheap
-  preliminary, not the claim).
-- **Arms:** (1) residual-only alloc, (2) residual+uncertainty alloc, (3) shuffled-
-  uncertainty alloc.
-- **Claim only if** `residual+uncertainty` beats `residual-only` AND
-  `residual+shuffled-uncertainty ≈ residual-only`. Otherwise the uncertainty branch is a
-  no-go (residual is the stronger signal for known elliptic problems).
+- **Stochastic NO:** mini deep ensemble of M=3 independent `TinyNO` members
+  (seeds `seed_base`, `+1000`, `+2000`), each with its own train-cloud draw + label
+  noise. `u_NO = mean`, `σ = std` across members (epistemic disagreement).
+  Cached as `data/no_ens_seed{s}.npz` (`--force` to retrain). Phase-1 single-model
+  checkpoints remain untouched.
+- **Arms (new; do not reuse Phase-1 uniform):**
+  1. `residual_only` — density ∝ |R(u_NO)| (same policy as Phase-1 residual_alloc).
+  2. `residual_unc` — density ∝ unit-mean(|R|) + λ_unc · unit-mean(σ)
+     (default λ_unc=1.0).
+  3. `shuffled_unc` — same blend with σ spatially permuted (control).
+- **Claim (pre-registered):** residual_unc beats residual_only by ≥1.2× rel-L2
+  reduction AND shuffled_unc ≉ residual_unc / does not beat residual_only.
+  If residual_unc ties residual_only, or shuffled matches residual_unc → **NO-GO**
+  (residual already carries the signal). High corr(σ,|R|) is a valid scientific NO-GO.
 
 ## Directory Structure
 
 ```
-├── README.md              # this file
-├── common.py              # shared problem + RBF kernel (imports sibling benchmark)
-├── no_model.py            # cheap JAX Neural Operator (FNO/DeepONet) → u_NO
-├── run_train_no.py        # train the NO surrogate
-├── run_pipeline.py        # end-to-end: residual → allocate → solve v_RBF → metric
-├── evaluate.py            # metric computation (rel-L2, per-arm table)
-├── results/               # per-arm metrics + tables
-└── figures/               # error maps, allocation density, arm table
+├── README.md                 # this file
+├── common.py                 # shared problem + RBF allocation (Phase 1+2)
+├── no_model.py               # TinyNO + TinyNOEnsemble (numpy float64)
+├── run_train_no.py           # train Phase-1 single-model NO
+├── run_pipeline.py           # Phase 1 end-to-end
+├── evaluate.py               # Phase 1 arm table / go-no-go
+├── run_pipeline_stoch.py     # Phase 2 ensemble + residual±σ allocation
+├── evaluate_stoch.py         # Phase 2 arm table / go-no-go
+├── results/                  # per-arm metrics + tables
+└── figures/                  # diagnostic maps
 ```
 
 ## How to run
 
 ```bash
-python run_train_no.py          # train the cheap NO → u_NO (CPU/GPU)
-python run_pipeline.py          # residual-allocated distillation + metric
-python evaluate.py              # print arm table / go-no-go
+# Phase 1
+python run_train_no.py
+python run_pipeline.py
+python evaluate.py
+
+# Phase 2 (same GO cell: K=64, resolution=40, vertical, kappa_jump=10)
+python run_pipeline_stoch.py --seeds 0,1,2 --K 64 --resolution 40 --skip-figures
+python evaluate_stoch.py --seeds 0,1,2
 ```
+
+Sibling venv: `../interface_anisotropic_rbf/.venv/bin/python`.
 
 ## Status
 
-Phase 1 (deterministic residual-allocated distillation) being implemented.
-Phase 2 (stochastic NO + uncertainty) gated on phase 1.
+Phase 1 (deterministic residual-allocated distillation): **GO** (passed).
+Phase 2 (stochastic NO + uncertainty): implemented; see `results/phase2_verdict.json`.

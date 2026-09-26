@@ -153,3 +153,131 @@ def train_no_surrogate(
             flush=True,
         )
     return model, info
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: mini deep ensemble (epistemic disagreement)
+# ---------------------------------------------------------------------------
+
+ENSEMBLE_SIZE = 3
+ENSEMBLE_SEED_STRIDE = 1000
+
+
+def ensemble_member_seeds(seed_base: int, m: int = ENSEMBLE_SIZE) -> list[int]:
+    """Independent member seeds: seed_base, seed_base+1000, seed_base+2000, …"""
+    base = int(seed_base)
+    return [base + i * ENSEMBLE_SEED_STRIDE for i in range(int(m))]
+
+
+def ensemble_checkpoint_path(seed: int, data_dir: Path | None = None) -> Path:
+    d = data_dir or DATA_DIR
+    return d / f"no_ens_seed{int(seed)}.npz"
+
+
+@dataclass
+class TinyNOEnsemble:
+    """M independent TinyNO members; predictive mean + epistemic std."""
+
+    members: list[TinyNO]
+    seed_base: int
+
+    def __post_init__(self) -> None:
+        if not self.members:
+            raise ValueError("ensemble needs ≥1 member")
+
+    @property
+    def m(self) -> int:
+        return len(self.members)
+
+    def predict_members(self, points: np.ndarray) -> np.ndarray:
+        """Stack member predictions. Shape (M, N)."""
+        preds = [m.predict(points) for m in self.members]
+        return np.stack(preds, axis=0)
+
+    def predict_mean_std(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """u_no = mean over members, sigma = std (ddof=0 epistemic disagreement)."""
+        stack = self.predict_members(points)
+        u_mean = stack.mean(axis=0)
+        # Population std over members — epistemic disagreement, not sample-of-population.
+        sigma = stack.std(axis=0, ddof=0)
+        return u_mean.astype(np.float64), sigma.astype(np.float64)
+
+    def predict(self, points: np.ndarray) -> np.ndarray:
+        u_mean, _ = self.predict_mean_std(points)
+        return u_mean
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "seed_base": int(self.seed_base),
+            "m": int(self.m),
+            "members": [m.to_state() for m in self.members],
+        }
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "TinyNOEnsemble":
+        members = [TinyNO.from_state(s) for s in state["members"]]
+        return cls(members=members, seed_base=int(state["seed_base"]))
+
+
+def save_ensemble(ens: TinyNOEnsemble, path: Path | None = None) -> Path:
+    path = path or ensemble_checkpoint_path(ens.seed_base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, state=np.asarray(ens.to_state(), dtype=object))
+    return path
+
+
+def load_ensemble(path: Path) -> TinyNOEnsemble:
+    raw = np.load(path, allow_pickle=True)
+    state = raw["state"].item()
+    return TinyNOEnsemble.from_state(state)
+
+
+def train_ensemble(
+    u_exact_fn,
+    seed_base: int = 0,
+    cfg: TinyNOConfig | None = None,
+    m: int = ENSEMBLE_SIZE,
+    kappa_m: float = 1.0,
+    kappa_p: float = 10.0,
+    gamma: str = "vertical",
+    verbose: bool = True,
+) -> tuple[TinyNOEnsemble, dict[str, Any]]:
+    """Train M independent TinyNO members on independent train-cloud draws.
+
+    Same manufactured target and train-cloud *distribution*, but each member gets
+    its own RNG subsample + label noise (seeds seed_base, +1000, +2000, …).
+    Do NOT average training data across members — independence drives disagreement.
+    """
+    cfg = cfg or TinyNOConfig()
+    member_seeds = ensemble_member_seeds(seed_base, m=m)
+    members: list[TinyNO] = []
+    member_infos: list[dict[str, float]] = []
+    if verbose:
+        print(
+            f"  [ensemble seed_base={seed_base}] M={m} members "
+            f"seeds={member_seeds}",
+            flush=True,
+        )
+    for ms in member_seeds:
+        model, info = train_no_surrogate(
+            u_exact_fn=u_exact_fn,
+            seed=ms,
+            cfg=cfg,
+            kappa_m=kappa_m,
+            kappa_p=kappa_p,
+            gamma=gamma,
+            verbose=verbose,
+        )
+        members.append(model)
+        member_infos.append(info)
+    ens = TinyNOEnsemble(members=members, seed_base=int(seed_base))
+    info_out: dict[str, Any] = {
+        "seed_base": int(seed_base),
+        "m": int(m),
+        "member_seeds": member_seeds,
+        "members": member_infos,
+        "mean_train_rel_l2": float(
+            np.mean([mi["train_rel_l2"] for mi in member_infos])
+        ),
+    }
+    return ens, info_out

@@ -3,7 +3,11 @@ __pycache__/
 data/*.npz
 data/no_train_meta.json
 results/*_seed*.json
+results/*_stoch_seed*.json
 results/pipeline_summary.json
 results/arm_table.*
+results/phase2_pipeline_summary.json
+results/phase2_arm_table.*
+results/phase2_verdict.json
 results/example_sub_experiment/
 figures/*.png

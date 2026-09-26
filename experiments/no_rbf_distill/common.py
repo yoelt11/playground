@@ -430,3 +430,137 @@ ALLOCATORS: dict[str, Callable[..., np.ndarray]] = {
 }
 
 ARM_NAMES = ("uniform", "residual_alloc", "shuffled_alloc")
+
+# ---------------------------------------------------------------------------
+# Phase 2 allocation: residual ± uncertainty blend
+# ---------------------------------------------------------------------------
+
+DEFAULT_LAMBDA_UNC = 1.0
+STOCH_ARM_NAMES = ("residual_only", "residual_unc", "shuffled_unc")
+
+
+def _normalize_unit_mean(v: np.ndarray) -> np.ndarray:
+    """Scale nonnegative field so mean==1 (or all-ones if near-zero)."""
+    v = np.asarray(v, dtype=np.float64).ravel()
+    v = np.maximum(v, 0.0)
+    m = float(v.mean())
+    if m < 1e-30:
+        return np.ones_like(v)
+    return v / m
+
+
+def _blend_residual_sigma(
+    abs_r: np.ndarray,
+    sigma: np.ndarray,
+    lambda_unc: float = DEFAULT_LAMBDA_UNC,
+) -> np.ndarray:
+    """Genuine blend: unit-mean |R| + λ · unit-mean σ (neither term dominates by scale)."""
+    r_n = _normalize_unit_mean(abs_r)
+    s_n = _normalize_unit_mean(sigma)
+    return r_n + float(lambda_unc) * s_n
+
+
+def allocate_residual_unc(
+    k: int,
+    grid: np.ndarray,
+    residual_flat: np.ndarray,
+    sigma_flat: np.ndarray,
+    interior_idx: np.ndarray,
+    seed: int,
+    lambda_unc: float = DEFAULT_LAMBDA_UNC,
+    uniform_floor: float = UNIFORM_FLOOR,
+) -> np.ndarray:
+    """Importance-sample K centers with density ∝ (|R|_norm + λ σ_norm)² + floor."""
+    rng = np.random.default_rng(seed + 502)
+    idx = np.asarray(interior_idx, dtype=int)
+    pts = np.asarray(grid, dtype=np.float64)[idx]
+    abs_r = np.abs(np.asarray(residual_flat, dtype=np.float64).ravel()[idx])
+    sig = np.asarray(sigma_flat, dtype=np.float64).ravel()[idx]
+    blend = _blend_residual_sigma(abs_r, sig, lambda_unc=lambda_unc)
+    w = _importance_weights(blend, uniform_floor=uniform_floor, power=2.0)
+    if len(pts) >= k:
+        chosen = rng.choice(len(pts), size=k, replace=False, p=w)
+        centers = pts[chosen].copy()
+    else:
+        n_side = int(np.sqrt(len(grid)))
+        h = 1.0 / max(n_side - 1, 1)
+        centers = _greedy_weighted_centers(pts, w, k, rng, min_sep=0.5 * h)
+    return _clip_interior(centers)
+
+
+def allocate_residual_shuffledunc(
+    k: int,
+    grid: np.ndarray,
+    residual_flat: np.ndarray,
+    sigma_flat: np.ndarray,
+    interior_idx: np.ndarray,
+    seed: int,
+    lambda_unc: float = DEFAULT_LAMBDA_UNC,
+    uniform_floor: float = UNIFORM_FLOOR,
+) -> np.ndarray:
+    """Same residual+σ blend, but σ permuted over interior nodes (spatial control).
+
+    Preserves the marginal σ distribution while destroying the uncertainty map.
+    |R| stays spatially intact so the control isolates whether the σ *map* matters.
+    """
+    rng = np.random.default_rng(seed + 603)
+    idx = np.asarray(interior_idx, dtype=int)
+    pts = np.asarray(grid, dtype=np.float64)[idx]
+    abs_r = np.abs(np.asarray(residual_flat, dtype=np.float64).ravel()[idx])
+    sig = np.asarray(sigma_flat, dtype=np.float64).ravel()[idx]
+    sig_shuf = rng.permutation(sig)
+    blend = _blend_residual_sigma(abs_r, sig_shuf, lambda_unc=lambda_unc)
+    w = _importance_weights(blend, uniform_floor=uniform_floor, power=2.0)
+    if len(pts) >= k:
+        chosen = rng.choice(len(pts), size=k, replace=False, p=w)
+        centers = pts[chosen].copy()
+    else:
+        n_side = int(np.sqrt(len(grid)))
+        h = 1.0 / max(n_side - 1, 1)
+        centers = _greedy_weighted_centers(pts, w, k, rng, min_sep=0.5 * h)
+    return _clip_interior(centers)
+
+
+def sigma_residual_overlap_diagnostics(
+    residual_flat: np.ndarray,
+    sigma_flat: np.ndarray,
+    interior_idx: np.ndarray,
+    top_frac: float = 0.1,
+) -> dict[str, float]:
+    """Spatial correlation / top-set overlap between σ and |R| (diagnostic)."""
+    idx = np.asarray(interior_idx, dtype=int)
+    abs_r = np.abs(np.asarray(residual_flat, dtype=np.float64).ravel()[idx])
+    sig = np.asarray(sigma_flat, dtype=np.float64).ravel()[idx]
+    n = len(idx)
+    if n < 3:
+        return {
+            "corr_sigma_abs_r": float("nan"),
+            "frac_top_unc_with_low_r": float("nan"),
+            "frac_top_r_with_low_unc": float("nan"),
+            "top_frac": float(top_frac),
+        }
+    # Pearson correlation
+    r_c = abs_r - abs_r.mean()
+    s_c = sig - sig.mean()
+    denom = float(np.linalg.norm(r_c) * np.linalg.norm(s_c))
+    corr = float(np.dot(r_c, s_c) / denom) if denom > 1e-30 else 0.0
+
+    k_top = max(1, int(np.ceil(top_frac * n)))
+    top_unc = np.argpartition(sig, -k_top)[-k_top:]
+    top_r = np.argpartition(abs_r, -k_top)[-k_top:]
+    # "low" = below median of the complementary field
+    r_med = float(np.median(abs_r))
+    s_med = float(np.median(sig))
+    frac_top_unc_low_r = float(np.mean(abs_r[top_unc] < r_med))
+    frac_top_r_low_unc = float(np.mean(sig[top_r] < s_med))
+    return {
+        "corr_sigma_abs_r": corr,
+        "frac_top_unc_with_low_r": frac_top_unc_low_r,
+        "frac_top_r_with_low_unc": frac_top_r_low_unc,
+        "top_frac": float(top_frac),
+        "sigma_mean": float(sig.mean()),
+        "sigma_std": float(sig.std()),
+        "sigma_max": float(sig.max()),
+        "abs_r_mean": float(abs_r.mean()),
+        "abs_r_max": float(abs_r.max()),
+    }
